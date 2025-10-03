@@ -6,9 +6,14 @@
 #include "spdlog/spdlog.h"
 #include "xxh_x86dispatch.h"
 #include <algorithm>
+#include <asm-generic/errno.h>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <complex>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <dirent.h>
@@ -25,41 +30,83 @@
 #include <semaphore.h>
 #include <string>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/sysmacros.h>
+#include <thread>
 #include <unistd.h>
 
+#define BUDDY_ALLOC_IMPLEMENTATION
+#include "buddy_alloc.h"
+
+#define JOBS_PER_FILE 4
 #define BUF_SIZE (1024UL * 1024 * 128)
 #define QUEUE_SIZE 64
 
-#define MAX_FILES 30000
-sem_t globalFileSem;
+#define MAX_FILES 50000
 size_t done = 0;
 
 #define INITIAL_READLINK_BUF_SIZE 512
 
 #define ISDOT(a) (a[0] == '.' && (!a[1] || (a[1] == '.' && !a[2])))
 
+// https://rigtorp.se/spinlock
+struct spinlock {
+    std::atomic<bool> lock_ = {0};
+
+    void lock() noexcept {
+        for (;;) {
+            // Optimistically assume the lock is free on the first try
+            if (!lock_.exchange(true, std::memory_order_acquire)) {
+                return;
+            }
+            // Wait for lock to be released without generating cache misses
+            while (lock_.load(std::memory_order_relaxed)) {
+                // Issue X86 PAUSE or ARM YIELD instruction to reduce contention
+                // between hyper-threads
+                __builtin_ia32_pause();
+            }
+        }
+    }
+
+    bool try_lock() noexcept {
+        // First do a relaxed load to check if lock is free in order to prevent
+        // unnecessary cache misses if someone does while(!try_lock())
+        return !lock_.load(std::memory_order_relaxed) &&
+               !lock_.exchange(true, std::memory_order_acquire);
+    }
+
+    void unlock() noexcept { lock_.store(false, std::memory_order_release); }
+};
+
 struct FileCopyJob {
-    std::string remote;
-    std::string partial;
+    bool active;
+
+    const char *remote;
+    const char *partial;
 
     struct statx stx;
 
     int srcFd;
     int dstFd;
 
-    // uint8_t srcHash[8];
+    size_t blockSize;
+
+    size_t nBlockJobsScheduled;
+    size_t nBlockJobsFinished;
 };
 
 enum RW {
     READ = 0,
     WRITE = 1,
+    READDST = 2,
 };
 
 const char *rwStrings[] = {"READ", "WRITE"};
 
 struct BlockCopyJob {
-    FileCopyJob parent;
+    int jobno; // ID within parent
+
+    FileCopyJob *parent;
 
     struct iocb cb;
 
@@ -73,12 +120,11 @@ struct BlockCopyJob {
 
     bool inUse;
 
-    XXH3_state_t *srcHashState;
-    XXH3_state_t *dstHashState;
+    XXH128_hash_t srcHash;
 };
 
 struct HLinkInfo {
-    omp_lock_t mut;
+    spinlock lock;
 
     bool transferred;
     uint64_t destInode;
@@ -87,19 +133,60 @@ struct HLinkInfo {
 };
 
 struct HLinkState {
-    omp_lock_t mut;
-    gtl::flat_hash_map<uint64_t, HLinkInfo> srcToDst;
+    spinlock lock;
+
+    gtl::flat_hash_map<uint64_t, HLinkInfo *> srcToDst;
     gtl::flat_hash_map<uint64_t, uint64_t> dstToSrc;
 };
 
+struct SharedState {
+    moodycamel::ConcurrentQueue<FileCopyJob> jobQueue;
+    HLinkState hlinkState;
+    sem_t fdSem;
+
+    std::atomic<size_t> nFinished;
+    std::atomic_size_t bytesRead;
+    std::atomic_size_t bytesWritten;
+
+    std::atomic<int> crawlDone;
+
+    spinlock allocLock;
+    buddy *allocator;
+
+    size_t nscheds;
+    struct CopyScheduler *scheds;
+};
+
+inline size_t blockSize(size_t fsize) {
+    return std::max(4096UL,
+                    std::min(16UL * (1 << 20), ceiling_power_of_two(fsize / 4)));
+}
+
+inline size_t blockCount(size_t fsize, size_t blockSize) {
+    return (fsize / blockSize) + (size_t)((fsize % blockSize) > 0);
+}
+
+template <> struct fmt::formatter<FileCopyJob> : fmt::formatter<std::string> {
+    auto format(const FileCopyJob &my, format_context &ctx) const
+        -> decltype(ctx.out()) {
+        return fmt::format_to(
+            ctx.out(),
+            "[FileCopyJob remote={}, partial={}, "
+            "fileSize={}, blockSize={}, nScheduled={}, nFinished={}/{}]",
+            my.remote, my.partial, my.stx.stx_size, my.blockSize,
+            my.nBlockJobsScheduled, my.nBlockJobsFinished,
+            blockCount(my.stx.stx_size, my.blockSize));
+    }
+};
+
 template <> struct fmt::formatter<BlockCopyJob> : fmt::formatter<std::string> {
-    auto format(BlockCopyJob my, format_context &ctx) const
+    auto format(const BlockCopyJob &my, format_context &ctx) const
         -> decltype(ctx.out()) {
         return fmt::format_to(ctx.out(),
-                              "[BlockCopyJob remote={}, type={}, status={}, "
-                              "offset={}, nbytes={}, fileSize={}]",
-                              my.parent.remote, rwStrings[my.type], my.status,
-                              my.offset, my.nbytes, my.parent.stx.stx_size);
+                              "[BlockCopyJob parent={}, type={}, status={}, "
+                              "offset={}, nbytes={}, buf={}]",
+                              *my.parent, rwStrings[my.type], my.status,
+                              my.offset, my.nbytes, (void *)my.data);
     }
 };
 
@@ -152,6 +239,8 @@ static void wr_done(io_context_t ctx, struct iocb *iocb, long res, long res2) {
     BlockCopyJob *job =
         (BlockCopyJob *)((uint8_t *)iocb - offsetof(BlockCopyJob, cb));
 
+    spdlog::debug("wr_done {}", *job);
+
     job->status = 0;
     if (res <= 0)
         job->status = -res;
@@ -166,20 +255,409 @@ static void rd_done(io_context_t ctx, struct iocb *iocb, long res, long res2) {
     BlockCopyJob *job =
         (BlockCopyJob *)((uint8_t *)iocb - offsetof(BlockCopyJob, cb));
 
+    spdlog::debug("rd_done {}", *job);
+
     job->status = 0;
     if (res <= 0)
         job->status = -res;
     else if (res != iocb->u.c.nbytes) {
-        fprintf(stderr, "ERROR: read missed bytes expect %lu got %ld\n",
-                iocb->u.c.nbytes, res);
+        spdlog::error("{}: read missed bytes expected {} got {}", *job,
+                      iocb->u.c.nbytes, res);
+        job->status = EIO;
     }
+}
+
+struct CopyScheduler {
+    bool done;
+
+    size_t nFileCopyJobs;
+    size_t nBlockCopyJobsPerFileCopyJob;
+    FileCopyJob *fileCopyJobs;
+    BlockCopyJob *blockCopyJobs;
+
+    iocb **cbBatch;
+    size_t cbBatchSize;
+
+    io_context_t ctx;
+};
+
+int createScheduler(CopyScheduler *sched, size_t nFileCopyJobs,
+                    size_t nBlockCopyJobsPerFileCopyJob) {
+    *sched = {
+        .done = false,
+        .nFileCopyJobs = nFileCopyJobs,
+        .nBlockCopyJobsPerFileCopyJob = nBlockCopyJobsPerFileCopyJob,
+        .fileCopyJobs =
+            (FileCopyJob *)calloc(nFileCopyJobs, sizeof(FileCopyJob)),
+        .blockCopyJobs = (BlockCopyJob *)calloc(
+            nBlockCopyJobsPerFileCopyJob * nFileCopyJobs, sizeof(BlockCopyJob)),
+        .cbBatch = (iocb **)calloc(nFileCopyJobs * nBlockCopyJobsPerFileCopyJob,
+                                   sizeof(iocb *)),
+        .cbBatchSize = 0,
+    };
+
+    int ret;
+    if ((ret = io_queue_init(nFileCopyJobs * nBlockCopyJobsPerFileCopyJob,
+                             &sched->ctx))) {
+        spdlog::error("Failed to create aio queue: {}", strerror(-ret));
+        return 1;
+    }
+
+    return 0;
+}
+
+inline void schedulerClearBlockCopyJob(CopyScheduler *sched,
+                                       SharedState *sharedState,
+                                       FileCopyJob *fileJob,
+                                       BlockCopyJob *blockJob,
+                                       bool nofree = false) {
+    spdlog::trace("clearing {}", *blockJob);
+    if (!nofree) {
+        sharedState->allocLock.lock();
+        buddy_free(sharedState->allocator, blockJob->data);
+        sharedState->allocLock.unlock();
+
+        blockJob->data = nullptr;
+    }
+
+    *blockJob = {.data = blockJob->data};
+}
+
+void schedIOSubmitDeferred(CopyScheduler *sched, iocb *cb) {
+    assert(sched->cbBatchSize <
+           (sched->nFileCopyJobs * sched->nBlockCopyJobsPerFileCopyJob));
+    sched->cbBatch[sched->cbBatchSize++] = cb;
+}
+
+int schedIOSubmitBatch(CopyScheduler *sched, SharedState *sharedState) {
+    if (io_submit(sched->ctx, sched->cbBatchSize, sched->cbBatch) < 0) {
+        for (size_t i = 0; i < sched->cbBatchSize; i++) {
+            BlockCopyJob *blockJob =
+                (BlockCopyJob *)((uint8_t *)sched->cbBatch[i] -
+                                 offsetof(BlockCopyJob, cb));
+            FileCopyJob *fileJob = blockJob->parent;
+
+            spdlog::error("{} failed to queue aio request {}", *blockJob,
+                          strerror(errno));
+
+            schedulerClearBlockCopyJob(sched, sharedState, fileJob, blockJob);
+            fileJob->nBlockJobsScheduled--;
+            fileJob->nBlockJobsFinished++;
+        }
+        sched->cbBatchSize = 0;
+
+        return -1;
+    }
+
+    sched->cbBatchSize = 0;
+
+    return 0;
+}
+
+inline void schedulerScheduleBlockCopyJob(CopyScheduler *sched,
+                                          SharedState *sharedState,
+                                          FileCopyJob *fileJob,
+                                          BlockCopyJob *blockJob,
+                                          bool dataPreallocated = false) {
+    blockJob->jobno =
+        fileJob->nBlockJobsScheduled + fileJob->nBlockJobsFinished;
+    blockJob->parent = fileJob;
+    blockJob->cb = {};
+    blockJob->type = READ;
+    blockJob->status = EINPROGRESS;
+    blockJob->offset = fileJob->blockSize * blockJob->jobno;
+
+    if (blockJob->offset >= fileJob->stx.stx_size) {
+        schedulerClearBlockCopyJob(sched, sharedState, fileJob, blockJob);
+
+        return;
+    }
+
+    blockJob->nbytes = std::min(
+        fileJob->blockSize, (size_t)fileJob->stx.stx_size - blockJob->offset);
+    if (!dataPreallocated) {
+        sharedState->allocLock.lock();
+        void *data = buddy_malloc(sharedState->allocator, fileJob->blockSize);
+        sharedState->allocLock.unlock();
+
+        if (!data) {
+            spdlog::trace("{} failed to allocate {}", *fileJob,
+                          fileJob->blockSize);
+            schedulerClearBlockCopyJob(sched, sharedState, fileJob, blockJob);
+            return;
+        }
+
+        blockJob->data = data;
+    }
+    blockJob->inUse = true;
+
+    spdlog::trace("scheduling {}", *blockJob);
+    io_prep_pread(&blockJob->cb, fileJob->srcFd, blockJob->data,
+                  blockJob->nbytes, blockJob->offset);
+
+    iocb *cbp = &blockJob->cb;
+    io_set_callback(&blockJob->cb, rd_done);
+
+    schedIOSubmitDeferred(sched, &blockJob->cb);
+    // if (io_submit(sched->ctx, 1, &cbp) < 0) {
+    //     spdlog::error("{} failed to queue aio read {}", *blockJob,
+    //                   strerror(errno));
+    //     schedulerClearBlockCopyJob(sched, sharedState, fileJob, blockJob);
+    //     fileJob->nBlockJobsFinished++;
+    //
+    //     return;
+    // }
+    blockJob->jobno = fileJob->nBlockJobsScheduled++;
+}
+
+inline void schedulerUpdateBlockCopyJob(CopyScheduler *sched,
+                                        SharedState *sharedState,
+                                        FileCopyJob *fileJob,
+                                        BlockCopyJob *blockJob) {
+    if (blockJob->status == 0) {
+        if (blockJob->type == READ) {
+            sharedState->bytesRead += blockJob->nbytes;
+
+            io_prep_pwrite(&blockJob->cb, blockJob->parent->dstFd,
+                           blockJob->data, blockJob->nbytes, blockJob->offset);
+            iocb *cbp = &blockJob->cb;
+            blockJob->status = EINPROGRESS;
+            blockJob->type = WRITE;
+            io_set_callback(&blockJob->cb, wr_done);
+
+            // blockJob->srcHash = XXH3_128bits(blockJob->data,
+            // blockJob->nbytes);
+            spdlog::trace("{} hash is {:x}{:x}", *blockJob,
+                          blockJob->srcHash.high64, blockJob->srcHash.low64);
+
+            spdlog::trace("{} submitting write request corresponding "
+                          "to finished read request",
+                          *blockJob);
+
+            schedIOSubmitDeferred(sched, &blockJob->cb);
+            // if (io_submit(sched->ctx, 1, &cbp) < 0) {
+            //     spdlog::error("{} failed to enqueue aio write: {}",
+            //     *blockJob,
+            //                   strerror(errno));
+            //     schedulerClearBlockCopyJob(sched, sharedState, fileJob,
+            //                                blockJob);
+            //     fileJob->nBlockJobsScheduled--;
+            //     fileJob->nBlockJobsFinished++;
+            // }
+        } else if (blockJob->type == WRITE) {
+            spdlog::trace("{} write request finished", *blockJob);
+
+            sharedState->bytesWritten += blockJob->nbytes;
+
+            memset(blockJob->data, 0, blockJob->nbytes);
+            io_prep_pread(&blockJob->cb, blockJob->parent->dstFd,
+                          blockJob->data, blockJob->nbytes, blockJob->offset);
+            iocb *cbp = &blockJob->cb;
+            blockJob->status = EINPROGRESS;
+            blockJob->type = READDST;
+            io_set_callback(&blockJob->cb, rd_done);
+
+            spdlog::trace(
+                "{} submitting destination readback request corresponding "
+                "to finished write request",
+                *blockJob);
+
+            schedIOSubmitDeferred(sched, &blockJob->cb);
+            // if (io_submit(sched->ctx, 1, &cbp) < 0) {
+            //     spdlog::error("{} failed to enqueue aio dst readback: {}",
+            //                   *blockJob, strerror(errno));
+            //     schedulerClearBlockCopyJob(sched, sharedState, fileJob,
+            //                                blockJob);
+            //     fileJob->nBlockJobsScheduled--;
+            //     fileJob->nBlockJobsFinished++;
+            // }
+        } else {
+            spdlog::trace("{} readdst request finished", *blockJob);
+
+            // auto dstHash = XXH3_128bits(blockJob->data, blockJob->nbytes);
+            // spdlog::trace("{} dst hash is {:x}{:x}", *blockJob,
+            // dstHash.high64,
+            //               dstHash.low64);
+            // if (dstHash.high64 != blockJob->srcHash.high64 ||
+            //     dstHash.low64 != blockJob->srcHash.low64) {
+            //     spdlog::error(
+            //         "{} src vs dst hash mismatch {:x}{:x} vs {:x}{:x}",
+            //         *blockJob, blockJob->srcHash.high64,
+            //         blockJob->srcHash.low64, dstHash.high64, dstHash.low64);
+            // }
+
+            fileJob->nBlockJobsScheduled--;
+            fileJob->nBlockJobsFinished++;
+
+            schedulerClearBlockCopyJob(sched, sharedState, fileJob, blockJob,
+                                       true);
+            schedulerScheduleBlockCopyJob(sched, sharedState, fileJob, blockJob,
+                                          true);
+        }
+    } else if (blockJob->status != 0 && blockJob->status != EINPROGRESS) {
+
+        spdlog::error("{} aio request failed: {}", *blockJob,
+                      strerror(blockJob->status));
+        schedulerClearBlockCopyJob(sched, sharedState, fileJob, blockJob);
+    } else {
+    }
+}
+
+inline void schedulerClearFileCopyJob(CopyScheduler *sched,
+                                      SharedState *sharedState,
+                                      FileCopyJob *fileJob) {
+    BlockCopyJob *blockJobBase =
+        sched->blockCopyJobs +
+        (fileJob - sched->fileCopyJobs) * sched->nBlockCopyJobsPerFileCopyJob;
+
+    for (BlockCopyJob *it = blockJobBase;
+         it != blockJobBase + sched->nBlockCopyJobsPerFileCopyJob; it++) {
+        if (it->inUse) {
+            schedulerClearBlockCopyJob(sched, sharedState, fileJob, it);
+        }
+    }
+
+    close(fileJob->srcFd);
+    close(fileJob->dstFd);
+    sem_post(&sharedState->fdSem);
+
+    *fileJob = {};
+}
+
+int schedulerTick(CopyScheduler *sched, SharedState *sharedState) {
+    schedIOSubmitBatch(sched, sharedState);
+
+    int rc = io_queue_run(sched->ctx);
+    if (rc < 0) {
+        spdlog::error("aio queue error: {}", strerror(-rc));
+        return -rc;
+    } else {
+        return 0;
+    }
+}
+
+int schedulerUpdate(CopyScheduler *sched, SharedState *sharedState,
+                    moodycamel::ConcurrentQueue<FileCopyJob> &jobQueue) {
+    // update current block jobs
+    for (int i = 0; i < sched->nFileCopyJobs; i++) {
+        FileCopyJob *fileJob = &sched->fileCopyJobs[i];
+        if (!fileJob->active) {
+            continue;
+        }
+
+        for (size_t j = 0; j < sched->nBlockCopyJobsPerFileCopyJob; j++) {
+            BlockCopyJob *blockJob =
+                &sched->blockCopyJobs[i * sched->nBlockCopyJobsPerFileCopyJob +
+                                      j];
+            if (blockJob->inUse) {
+                schedulerUpdateBlockCopyJob(sched, sharedState, fileJob,
+                                            blockJob);
+            }
+        }
+    }
+
+    // check for file job completion
+    // for (int i = 0; i < sched->nFileCopyJobs; i++) {
+    //     FileCopyJob *fileJob = &sched->fileCopyJobs[i];
+    //     if (!fileJob->active) {
+    //         continue;
+    //     }
+    //
+    //     if (fileJob->nBlockJobsFinished >=
+    //         blockCount(fileJob->stx.stx_size, fileJob->blockSize)) {
+    //         spdlog::debug("{} finished", *fileJob);
+    //
+    //         sharedState->nFinished++;
+    //
+    //         schedulerClearFileCopyJob(sched, sharedState, fileJob);
+    //     }
+    // }
+
+    // schedule new block jobs
+    for (int i = 0; i < sched->nFileCopyJobs; i++) {
+        FileCopyJob *fileJob = &sched->fileCopyJobs[i];
+        if (!fileJob->active) {
+            continue;
+        }
+
+        if (fileJob->nBlockJobsFinished >=
+            blockCount(fileJob->stx.stx_size, fileJob->blockSize)) {
+            spdlog::debug("{} finished", *fileJob);
+
+            sharedState->nFinished++;
+
+            schedulerClearFileCopyJob(sched, sharedState, fileJob);
+
+            continue;
+        }
+
+        for (size_t j = 0;
+             j < sched->nBlockCopyJobsPerFileCopyJob &&
+             (fileJob->nBlockJobsFinished + fileJob->nBlockJobsScheduled) <
+                 blockCount(fileJob->stx.stx_size, fileJob->blockSize);
+             j++) {
+            BlockCopyJob *blockJob =
+                &sched->blockCopyJobs[i * sched->nBlockCopyJobsPerFileCopyJob +
+                                      j];
+            if (!blockJob->inUse) {
+                spdlog::debug("{} scheduling block job", *fileJob);
+                schedulerScheduleBlockCopyJob(sched, sharedState, fileJob,
+                                              blockJob);
+                // break;
+                // only schedule on job per file job per pass to
+                // encourage more even distribution across fds
+            }
+        }
+    }
+
+    // schedule new jobs
+    size_t activeJobs = 0; // this is not an accurate counter
+                           // for (int j = 0; j < 64; j++) {
+    for (int i = 0; i < sched->nFileCopyJobs; i++) {
+        FileCopyJob newJob;
+        if (!sched->fileCopyJobs[i].active) {
+            if (jobQueue.try_dequeue(newJob)) {
+                sched->fileCopyJobs[i] = newJob;
+                sched->fileCopyJobs[i].nBlockJobsScheduled = 0;
+                sched->fileCopyJobs[i].nBlockJobsFinished = 0;
+                sched->fileCopyJobs[i].active = true;
+                // activeJobs++;
+
+                // break;
+            } else {
+                break;
+            }
+        } else {
+            // activeJobs++;
+        }
+    }
+    // }
+    for (int i = 0; i < sched->nFileCopyJobs; i++) {
+        activeJobs += (size_t)(sched->fileCopyJobs[i].active);
+    }
+
+    if (!activeJobs && sharedState->crawlDone) {
+        return 0;
+    }
+
+    // if we have maximum number of i/o's in flight
+    // then wait for one to complete
+    // if (full) {
+    //     rc = io_getevents(ctx, 0, 0, NULL, NULL);
+    //     if (rc < 0)
+    //         spdlog::error("io wait error: {}", strerror(-rc));
+    // }
+    //
+    // sleep(1);
+    schedulerTick(sched, sharedState);
+
+    return EINPROGRESS;
 }
 
 int processNonDir(const std::string path,
                   std::shared_ptr<FileDescriptor> parentFD,
-                  std::optional<dev_t> dev,
-                  moodycamel::ConcurrentQueue<FileCopyJob> &jobQueue,
-                  size_t srcRootLen, int srcRootFD, int destRootFD) {
+                  std::optional<dev_t> dev, size_t srcRootLen, int srcRootFD,
+                  int destRootFD, SharedState *sharedState) {
 
     const char *remote = path.c_str() + srcRootLen;
     if (remote[0] == '/') {
@@ -191,6 +669,7 @@ int processNonDir(const std::string path,
                     XXH3_64bits_withSeed(remote, strlen(remote), 0));
 
     bool shouldTransfer = false;
+    bool exists = true;
 
     struct statx stx;
     if (statx(AT_FDCWD, path.c_str(), AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS,
@@ -199,12 +678,13 @@ int processNonDir(const std::string path,
         return 1;
     }
 
-    struct statx destStx;
+    struct statx destStx = {};
     if (statx(destRootFD, remote, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS,
               &destStx) < 0) {
 
         if (errno == ENOENT) {
             shouldTransfer = true;
+            exists = false;
         } else {
             spdlog::error("Failed to statx dest {}: {}\n", remote,
                           strerror(errno));
@@ -216,12 +696,68 @@ int processNonDir(const std::string path,
                              sizeof(stx.stx_mtime)) != 0 ||
                       stx.stx_size != destStx.stx_size;
 
+    sharedState->hlinkState.lock.lock();
+    auto srcHLIt = sharedState->hlinkState.srcToDst.find(stx.stx_ino);
+    if (srcHLIt != sharedState->hlinkState.srcToDst.end()) {
+        shouldTransfer = false;
+        bool wrongInode = destStx.stx_ino != srcHLIt->second->destInode;
+        if (!exists || wrongInode) {
+            if (wrongInode) {
+                spdlog::debug(
+                    "{} has incorrect inode on destination. Relinking to {}",
+                    remote, srcHLIt->second->remote.c_str());
+            }
+
+            if (srcHLIt->second->transferred) {
+                spdlog::debug(
+                    "{} has already been transferred. Hardlinking to {}",
+                    srcHLIt->second->remote.c_str(), remote);
+                if (linkat(destRootFD, srcHLIt->second->remote.c_str(),
+                           destRootFD, remote, 0)) {
+                    spdlog::error("Failed to hardlink {} to {}",
+                                  srcHLIt->second->remote.c_str(), remote);
+                }
+            } else {
+                spdlog::debug(
+                    "{} has not been transferred. Queueing hardlinkage to {}",
+                    srcHLIt->second->remote.c_str(), remote);
+                srcHLIt->second->links.push_back(remote);
+            }
+        }
+    } else {
+        HLinkInfo *phstate = new HLinkInfo;
+        sharedState->hlinkState.srcToDst[stx.stx_ino] = phstate;
+        auto &nState = *phstate;
+        nState.remote = remote;
+        nState.destInode = destStx.stx_ino;
+        nState.transferred = false;
+
+        if (exists) {
+            auto destHLState =
+                sharedState->hlinkState.dstToSrc.find(destStx.stx_ino);
+
+            if (destHLState != sharedState->hlinkState.dstToSrc.end()) {
+                if (destHLState->second != stx.stx_ino) {
+                    spdlog::debug("Destination to source inode mapping {}->{} "
+                                  "for {} doesn't match "
+                                  "expected {}->{}. Transferring",
+                                  destStx.stx_ino, stx.stx_ino, destStx.stx_ino,
+                                  remote, destHLState->second);
+                    shouldTransfer = true;
+                }
+            } else {
+                sharedState->hlinkState.dstToSrc[destStx.stx_ino] = stx.stx_ino;
+            }
+        }
+    }
+    sharedState->hlinkState.lock.unlock();
+
     if (shouldTransfer) {
-        unlinkat(destRootFD, partial.c_str(), AT_SYMLINK_NOFOLLOW);
+        unlinkat(destRootFD, partial.c_str(), 0);
 
         if (S_ISREG(stx.stx_mode)) {
 
-            sem_wait(&globalFileSem);
+            sem_wait(&sharedState->fdSem);
             int srcFd = openat(srcRootFD, remote, O_RDONLY | O_DIRECT);
             if (srcFd < 0) {
                 spdlog::error("failed to open src {}: {}\n", remote,
@@ -238,7 +774,7 @@ int processNonDir(const std::string path,
                 return 1;
             }
 
-            if (fchownat(destRootFD, remote, stx.stx_uid, stx.stx_gid,
+            if (fchownat(destRootFD, partial.c_str(), stx.stx_uid, stx.stx_gid,
                          AT_SYMLINK_NOFOLLOW) < 0) {
                 spdlog::error("failed to fchownat {}: {}", remote,
                               strerror(errno));
@@ -251,12 +787,26 @@ int processNonDir(const std::string path,
                 return 1;
             }
 
-            jobQueue.enqueue({
-                .remote = std::move(remote),
-                .partial = std::move(partial),
+            struct stat destStat;
+            if (fstat(dstFd, &destStat) < 0) {
+                spdlog::error("failed to stat destfd {} ({}): {}", dstFd,
+                              remote, strerror(errno));
+                return 1;
+            }
+
+            sharedState->hlinkState.lock.lock();
+            sharedState->hlinkState.srcToDst[stx.stx_ino]->destInode =
+                destStat.st_ino;
+            sharedState->hlinkState.dstToSrc[destStat.st_ino] = stx.stx_ino;
+            sharedState->hlinkState.lock.unlock();
+
+            sharedState->jobQueue.enqueue({
+                .remote = strdup(remote),
+                .partial = strdup(partial.c_str()),
                 .stx = stx,
                 .srcFd = srcFd,
                 .dstFd = dstFd,
+                .blockSize = blockSize(stx.stx_size),
             });
         } else if (S_ISLNK(stx.stx_mode)) {
             // symlinkat(, int tofd, const char *to)
@@ -277,20 +827,45 @@ int processNonDir(const std::string path,
 
             free(contents);
 
-            if (linkat(destRootFD, partial.c_str(), destRootFD, remote,
-                       AT_SYMLINK_NOFOLLOW) < 0) {
-                spdlog::error("failed to move (linkat)) {}->{}: {}",
+            if (unlinkat(destRootFD, remote, 0) < 0) {
+                if (errno != ENOENT) {
+                    spdlog::error("failed to move (unlinkat existing remote) "
+                                  "{}->{}: failed "
+                                  "to unlink {}: {}",
+                                  partial.c_str(), remote, partial.c_str(),
+                                  strerror(errno));
+                    return 1;
+                }
+            }
+
+            if (linkat(destRootFD, partial.c_str(), destRootFD, remote, 0) <
+                0) {
+                spdlog::error("failed to move (linkat) {}->{}: {}",
                               partial.c_str(), remote, strerror(errno));
                 return 1;
             }
 
-            if (unlinkat(destRootFD, partial.c_str(), AT_SYMLINK_NOFOLLOW) <
-                0) {
+            if (unlinkat(destRootFD, partial.c_str(), 0) < 0) {
                 spdlog::error(
                     "failed to move (unlinkat) {}->{}: failed to unlink {}: {}",
                     partial.c_str(), remote, partial.c_str(), strerror(errno));
                 return 1;
             }
+
+            struct stat destStat;
+            if (fstatat(destRootFD, remote, &destStat, AT_SYMLINK_NOFOLLOW) <
+                0) {
+                spdlog::error("failed to stat symlink {} : {}", remote,
+                              strerror(errno));
+                return 1;
+            }
+
+            sharedState->hlinkState.lock.lock();
+            sharedState->hlinkState.srcToDst[stx.stx_ino]->destInode =
+                destStat.st_ino;
+            sharedState->hlinkState.srcToDst[stx.stx_ino]->transferred = true;
+            sharedState->hlinkState.dstToSrc[destStat.st_ino] = stx.stx_ino;
+            sharedState->hlinkState.lock.unlock();
         }
     }
 
@@ -298,8 +873,8 @@ int processNonDir(const std::string path,
 }
 
 int processDir(const std::string &path, std::optional<dev_t> dev,
-               moodycamel::ConcurrentQueue<FileCopyJob> &jobQueue,
-               size_t srcRootLen, int srcRootFD, int destRootFD) {
+               size_t srcRootLen, int srcRootFD, int destRootFD,
+               SharedState *sharedState) {
 
     int fd = open(path.c_str(), O_RDONLY);
     auto sharedFD = std::make_shared<FileDescriptor>();
@@ -336,12 +911,12 @@ int processDir(const std::string &path, std::optional<dev_t> dev,
         return -1;
     }
 
-    sem_wait(&globalFileSem);
+    sem_wait(&sharedState->fdSem);
     DIR *dir = opendir(path.c_str());
     if (!dir) {
         fprintf(stderr, "ERROR: failed to open directory %s: %d (%s)\n",
                 path.c_str(), errno, strerror(errno));
-        sem_post(&globalFileSem);
+        sem_post(&sharedState->fdSem);
         return -1;
     }
 
@@ -356,20 +931,20 @@ int processDir(const std::string &path, std::optional<dev_t> dev,
         std::string newPath =
             path + std::string("/") + std::string((const char *)d->d_name);
         if (d->d_type == DT_DIR) {
-#pragma omp task shared(jobQueue)
-            processDir(newPath, dev, jobQueue, srcRootLen, srcRootFD,
-                       destRootFD);
+#pragma omp task
+            processDir(newPath, dev, srcRootLen, srcRootFD, destRootFD,
+                       sharedState);
         } else {
-#pragma omp task shared(jobQueue)
-            processNonDir(newPath, sharedFD, dev, jobQueue, srcRootLen,
-                          srcRootFD, destRootFD);
+#pragma omp task
+            processNonDir(newPath, sharedFD, dev, srcRootLen, srcRootFD,
+                          destRootFD, sharedState);
         }
     }
     // #pragma taskwait
     // close(fd);
 
     closedir(dir);
-    sem_post(&globalFileSem);
+    sem_post(&sharedState->fdSem);
 
     return 0;
 }
@@ -401,217 +976,134 @@ int main(int argc, char *argv[]) {
 
     spdlog::info("copying files from {} to {}", argv[1], argv[2]);
 
-    sem_init(&globalFileSem, 0, MAX_FILES);
+    SharedState *sharedState = new SharedState;
+    sem_init(&sharedState->fdSem, 0, MAX_FILES);
+
+    size_t arena_size = 100UL * (1UL << 30);
+    void *buddy_metadata = malloc(buddy_sizeof(arena_size));
+    void *buddy_arena;
+    posix_memalign(&buddy_arena, 4096, arena_size);
+    // malloc(arena_size);
+    sharedState->allocator =
+        buddy_init_alignment((unsigned char *)buddy_metadata,
+                             (unsigned char *)buddy_arena, arena_size, 4096);
 
     omp_set_nested(1);
     omp_set_max_active_levels(1024);
 
-    moodycamel::ConcurrentQueue<FileCopyJob> fileCopyQueue;
+    const int nScheds = 16; // omp_get_max_threads();
+    CopyScheduler *scheds = new CopyScheduler[nScheds];
+
+    for (int i = 0; i < nScheds; i++) {
+        CopyScheduler &sched = scheds[i];
+        if (createScheduler(&sched, 512, 4)) {
+            exit(1);
+        }
+    }
+
+    sharedState->scheds = scheds;
+    sharedState->nscheds = nScheds;
 
     int ret = 0;
-#pragma omp parallel sections shared(fileCopyQueue, done, globalFileSem)
+#pragma omp parallel sections
     {
 #pragma omp section
         {
 #pragma omp taskgroup
-            ret = processDir(root, std::nullopt, fileCopyQueue, strlen(root),
-                             srcRootFD, destRootFD);
-            // fprintf(stderr, "HERE, %p\n", &done);
-            done = 1;
+            ret = processDir(root, std::nullopt, strlen(root), srcRootFD,
+                             destRootFD, sharedState);
+            sharedState->crawlDone = 1;
         }
 
 #pragma omp section
         {
-            std::atomic<size_t> counter = 0;
-            std::atomic<size_t> bytesWritten = 0;
-#pragma omp parallel for shared(done)
-            for (int thr = 0; thr < 2; thr++) {
-                BlockCopyJob *requests = new BlockCopyJob[QUEUE_SIZE];
-                // (BlockCopyJob *)calloc(QUEUE_SIZE, sizeof(BlockCopyJob));
-                for (int i = 0; i < QUEUE_SIZE; i++) {
-                    requests[i] = {};
-                    requests[i].data = calloc(1, BUF_SIZE);
-                    posix_memalign(reinterpret_cast<void **>(&requests[i].data),
-                                   4096, BUF_SIZE);
-                    requests[i].srcHashState = XXH3_createState();
-                    requests[i].dstHashState = XXH3_createState();
-                    XXH3_128bits_reset(requests[i].srcHashState);
-                    XXH3_128bits_reset(requests[i].dstHashState);
+            double lastPrint = omp_get_wtime();
+            bool quit = false;
+            while (true) {
+                bool done = true;
+                for (int i = 0; i < sharedState->nscheds; i++) {
+                    if (!sharedState->scheds[i].done) {
+                        done = false;
+                        // spdlog::info("sched {} ({}) is done", i,
+                        //              (void *)(sharedState->scheds + i));
+                    } else {
+                        // spdlog::info("sched {} is done", i);
+                    }
                 }
 
-#define RESET_REQ                                                              \
-    close(requests[i].parent.srcFd);                                           \
-    close(requests[i].parent.dstFd);                                           \
-    XXH3_128bits_reset(requests[i].srcHashState);                              \
-    XXH3_128bits_reset(requests[i].dstHashState);                              \
-    requests[i] = {                                                            \
-        .data = requests[i].data,                                              \
-        .srcHashState = requests[i].srcHashState,                              \
-        .dstHashState = requests[i].dstHashState,                              \
-    };                                                                         \
-    sem_post(&globalFileSem);
+                if (done)
+                    break;
 
-                io_context_t ctx = {};
-                io_queue_init(QUEUE_SIZE, &ctx);
+                double now = omp_get_wtime();
+                double delta = now - lastPrint;
+                if (delta > 1.0 || (quit && (size_t)(delta * 1000) > 1.0)) {
+                    spdlog::info(
+                        "transfered {} files (read {} kbytes/sec, write {} "
+                        "kbytes/sec))",
+                        sharedState->nFinished.load(),
+                        ((sharedState->bytesRead.load() / 1024) * 1000) /
+                            (size_t)(delta * 1000),
+                        ((sharedState->bytesWritten.load() / 1024) * 1000) /
+                            (size_t)(delta * 1000));
 
-                int sval;
-                int full = true;
-                while (!done || sem_getvalue(&globalFileSem, &sval) ||
-                       (sval < MAX_FILES)) {
-                    for (int i = 0; i < QUEUE_SIZE; i++) {
-                        if (!requests[i].inUse) {
-                            FileCopyJob job;
-                            if (fileCopyQueue.try_dequeue(job)) {
-                                requests[i].parent = job;
-                                requests[i].inUse = true;
-
-                                requests[i].offset = 0;
-                                requests[i].nbytes = std::min(
-                                    (size_t)job.stx.stx_size, BUF_SIZE);
-                                // requests[i].cb.fildes = job.srcFd;
-                                io_prep_pread(&requests[i].cb, job.srcFd,
-                                              requests[i].data,
-                                              requests[i].nbytes,
-                                              requests[i].offset);
-
-                                iocb *cbp = &requests[i].cb;
-                                requests[i].status = EINPROGRESS;
-                                io_set_callback(&requests[i].cb, rd_done);
-
-                                spdlog::trace(
-                                    "{} submitting read request on new slot",
-                                    requests[i]);
-
-                                if (io_submit(ctx, 1, &cbp) < 0) {
-                                    spdlog::error(
-                                        "{} failed to enqueue initial aio read "
-                                        "request: {}",
-                                        requests[i], strerror(errno));
-                                    RESET_REQ
-                                } else {
-                                    requests[i].type = READ;
-                                }
-                            } else {
-                                full = false;
-                            }
-                        } else if (requests[i].inUse &&
-                                   requests[i].status == 0) {
-                            if (requests[i].type == READ) {
-                                XXH3_128bits_update(requests[i].srcHashState,
-                                                    requests[i].data,
-                                                    requests[i].nbytes);
-
-                                io_prep_pwrite(
-                                    &requests[i].cb, requests[i].parent.dstFd,
-                                    requests[i].data, requests[i].nbytes,
-                                    requests[i].offset);
-                                iocb *cbp = &requests[i].cb;
-                                requests[i].status = EINPROGRESS;
-                                io_set_callback(&requests[i].cb, wr_done);
-
-                                spdlog::trace(
-                                    "{} submitting write request corresponding "
-                                    "to finished read request",
-                                    requests[i]);
-
-                                if (io_submit(ctx, 1, &cbp) < 0) {
-                                    spdlog::error(
-                                        "{} failed to enqueue aio write: {}",
-                                        requests[i], strerror(errno));
-                                    RESET_REQ
-                                } else {
-                                    requests[i].type = WRITE;
-                                }
-                            } else if (requests[i].offset +
-                                           requests[i].nbytes >=
-                                       requests[i].parent.stx.stx_size) {
-                                spdlog::trace("{} copy finished...performing "
-                                              "final validation",
-                                              requests[i]);
-                                XXH3_128bits_update(requests[i].dstHashState,
-                                                    requests[i].data,
-                                                    requests[i].nbytes);
-
-                                XXH128_hash_t srcHash = XXH3_128bits_digest(
-                                    requests[i].srcHashState);
-                                XXH128_hash_t dstHash = XXH3_128bits_digest(
-                                    requests[i].dstHashState);
-
-                                if (memcmp(&srcHash, &dstHash,
-                                           sizeof(XXH128_hash_t)) != 0) {
-                                    spdlog::error("{} hashes don't match",
-                                                  requests[i]);
-                                }
-
-                                bytesWritten += requests[i].nbytes;
-
-                                counter++;
-                                if ((counter % 1000) == 0) {
-                                    spdlog::info(
-                                        "copied {} ({}G)", counter.load(),
-                                        bytesWritten / 1024 / 1024 / 1024);
-                                }
-                                RESET_REQ
-                            } else {
-                                XXH3_128bits_update(requests[i].dstHashState,
-                                                    requests[i].data,
-                                                    requests[i].nbytes);
-                                bytesWritten += requests[i].nbytes;
-                                requests[i].offset += requests[i].nbytes;
-                                assert(requests[i].parent.stx.stx_size >
-                                       requests[i].offset);
-                                requests[i].nbytes = std::min(
-                                    (size_t)requests[i].parent.stx.stx_size -
-                                        requests[i].offset,
-                                    (size_t)BUF_SIZE);
-                                // requests[i].cb.aio_fildes =
-                                //     requests[i].parent.srcFd;
-                                requests[i].type = READ;
-                                io_prep_pread(
-                                    &requests[i].cb, requests[i].parent.srcFd,
-                                    requests[i].data, requests[i].nbytes,
-                                    requests[i].offset);
-                                iocb *cbp = &requests[i].cb;
-                                requests[i].status = EINPROGRESS;
-                                io_set_callback(&requests[i].cb, rd_done);
-
-                                spdlog::trace("{} submitting read request",
-                                              requests[i]);
-                                if (io_submit(ctx, 1, &cbp) < 0) {
-                                    spdlog::error(
-                                        "{} failed to queue aio read {}",
-                                        requests[i], strerror(errno));
-                                    RESET_REQ
-                                }
-                            }
-                        } else if (requests[i].inUse &&
-                                   requests[i].status != 0 &&
-                                   requests[i].status != EINPROGRESS) {
-
-                            spdlog::error("{} aio request failed: {}",
-                                          requests[i],
-                                          strerror(requests[i].status));
-                            RESET_REQ
-                        } else {
+                    for (int i = 0; i < nScheds; i++) {
+                        size_t nFActive = 0;
+                        size_t nBActive = 0;
+                        for (int j = 0; j < scheds[i].nFileCopyJobs; j++) {
+                            nFActive +=
+                                (size_t)(scheds[i].fileCopyJobs[j].active);
                         }
+
+                        for (int j = 0;
+                             j < scheds[i].nBlockCopyJobsPerFileCopyJob *
+                                     scheds[i].nFileCopyJobs;
+                             j++) {
+                            nBActive +=
+                                (size_t)(scheds[i].blockCopyJobs[j].inUse);
+                        }
+
+                        spdlog::info("\tsched{}: {}/{}f, {}/{}b", i, nFActive,
+                                     scheds[i].nFileCopyJobs, nBActive,
+                                     scheds[i].nBlockCopyJobsPerFileCopyJob *
+                                         scheds[i].nFileCopyJobs);
                     }
 
-                    // Handle IO's that have completed
-                    int rc = io_queue_run(ctx);
-                    if (rc < 0)
-                        spdlog::error("aio queue error: %s\n", strerror(-rc));
+                    sharedState->bytesWritten = 0;
+                    sharedState->bytesRead = 0;
+                    lastPrint = omp_get_wtime();
+                }
 
-                    // if we have maximum number of i/o's in flight
-                    // then wait for one to complete
-                    if (full) {
-                        rc = io_getevents(ctx, 0, 0, NULL, NULL);
-                        if (rc < 0)
-                            spdlog::error("io wait error: {}", strerror(-rc));
+                if (quit) {
+                    spdlog::info("done: {}", delta);
+                    break;
+                }
+            }
+        }
+
+#pragma omp section
+        {
+
+            sharedState->bytesWritten = 0;
+            sharedState->bytesRead = 0;
+
+#pragma omp parallel num_threads(sharedState->nscheds)
+            {
+                int i = omp_get_thread_num();
+                while (true) {
+
+                    // spdlog::info("update scheduler {} ({})", i,
+                    //              (void *)(sharedState->scheds + i));
+                    if (schedulerUpdate(sharedState->scheds + i, sharedState,
+                                        sharedState->jobQueue) != EINPROGRESS) {
+                        scheds[i].done = true;
+                        break;
                     }
                 }
 
-                // std::cout << "DONE" << std::endl;
+                // spdlog::info("scheduler {} finished");
             }
+
+            spdlog::info("done with {} files", sharedState->nFinished.load());
         }
     }
 
