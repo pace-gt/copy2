@@ -42,7 +42,7 @@
 #define BUF_SIZE (1024UL * 1024 * 128)
 #define QUEUE_SIZE 64
 
-#define MAX_FILES 50000
+#define MAX_FILES 40000
 size_t done = 0;
 
 #define INITIAL_READLINK_BUF_SIZE 512
@@ -158,8 +158,8 @@ struct SharedState {
 };
 
 inline size_t blockSize(size_t fsize) {
-    return std::max(4096UL,
-                    std::min(16UL * (1 << 20), ceiling_power_of_two(fsize / 4)));
+    return std::max(
+        4096UL, std::min(128UL * (1 << 20), ceiling_power_of_two(fsize / 4)));
 }
 
 inline size_t blockCount(size_t fsize, size_t blockSize) {
@@ -648,7 +648,6 @@ int schedulerUpdate(CopyScheduler *sched, SharedState *sharedState,
     //         spdlog::error("io wait error: {}", strerror(-rc));
     // }
     //
-    // sleep(1);
     schedulerTick(sched, sharedState);
 
     return EINPROGRESS;
@@ -1101,6 +1100,31 @@ int main(int argc, char *argv[]) {
                 }
 
                 // spdlog::info("scheduler {} finished");
+            }
+
+            spdlog::info("done with {} files", sharedState->nFinished.load());
+        }
+
+#pragma omp section
+        {
+
+            sharedState->bytesWritten = 0;
+            sharedState->bytesRead = 0;
+
+#pragma omp parallel num_threads(sharedState->nscheds)
+            {
+                while (true) {
+
+                    int i = omp_get_thread_num();
+
+                    // spdlog::info("update scheduler {} ({})", i,
+                    //              (void *)(sharedState->scheds + i));
+                    if (schedulerUpdate(sharedState->scheds + i, sharedState,
+                                        sharedState->jobQueue) != EINPROGRESS) {
+                        scheds[i].done = true;
+                        break;
+                    }
+                }
             }
 
             spdlog::info("done with {} files", sharedState->nFinished.load());
