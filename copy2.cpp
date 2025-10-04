@@ -1,5 +1,5 @@
 #include "concurrentqueue.h"
-#include "gtl/phmap_fwd_decl.hpp"
+#include "gtl/phmap_fwd_decl.hpp" #include "spdlog/cfg/env.h"
 #include "spdlog/cfg/env.h"
 #include "spdlog/fmt/bundled/format.h"
 #include "spdlog/sinks/stdout_color_sinks.h"
@@ -42,7 +42,7 @@
 #define BUF_SIZE (1024UL * 1024 * 128)
 #define QUEUE_SIZE 64
 
-#define MAX_FILES 40000
+#define MAX_FILES 30000
 size_t done = 0;
 
 #define INITIAL_READLINK_BUF_SIZE 512
@@ -120,7 +120,7 @@ struct BlockCopyJob {
 
     bool inUse;
 
-    XXH128_hash_t srcHash;
+    XXH64_hash_t srcHash;
 };
 
 struct HLinkInfo {
@@ -159,7 +159,7 @@ struct SharedState {
 
 inline size_t blockSize(size_t fsize) {
     return std::max(
-        4096UL, std::min(128UL * (1 << 20), ceiling_power_of_two(fsize / 4)));
+        4096UL, std::min(32UL * (1 << 20), ceiling_power_of_two(fsize / 2)));
 }
 
 inline size_t blockCount(size_t fsize, size_t blockSize) {
@@ -330,23 +330,26 @@ void schedIOSubmitDeferred(CopyScheduler *sched, iocb *cb) {
 }
 
 int schedIOSubmitBatch(CopyScheduler *sched, SharedState *sharedState) {
-    if (io_submit(sched->ctx, sched->cbBatchSize, sched->cbBatch) < 0) {
-        for (size_t i = 0; i < sched->cbBatchSize; i++) {
-            BlockCopyJob *blockJob =
-                (BlockCopyJob *)((uint8_t *)sched->cbBatch[i] -
-                                 offsetof(BlockCopyJob, cb));
-            FileCopyJob *fileJob = blockJob->parent;
+    if (sched->cbBatchSize) {
+        if (io_submit(sched->ctx, sched->cbBatchSize, sched->cbBatch) < 0) {
+            for (size_t i = 0; i < sched->cbBatchSize; i++) {
+                BlockCopyJob *blockJob =
+                    (BlockCopyJob *)((uint8_t *)sched->cbBatch[i] -
+                                     offsetof(BlockCopyJob, cb));
+                FileCopyJob *fileJob = blockJob->parent;
 
-            spdlog::error("{} failed to queue aio request {}", *blockJob,
-                          strerror(errno));
+                spdlog::error("{} failed to queue aio request {}", *blockJob,
+                              strerror(errno));
 
-            schedulerClearBlockCopyJob(sched, sharedState, fileJob, blockJob);
-            fileJob->nBlockJobsScheduled--;
-            fileJob->nBlockJobsFinished++;
+                schedulerClearBlockCopyJob(sched, sharedState, fileJob,
+                                           blockJob);
+                fileJob->nBlockJobsScheduled--;
+                fileJob->nBlockJobsFinished++;
+            }
+            sched->cbBatchSize = 0;
+
+            return -1;
         }
-        sched->cbBatchSize = 0;
-
-        return -1;
     }
 
     sched->cbBatchSize = 0;
@@ -399,14 +402,7 @@ inline void schedulerScheduleBlockCopyJob(CopyScheduler *sched,
     io_set_callback(&blockJob->cb, rd_done);
 
     schedIOSubmitDeferred(sched, &blockJob->cb);
-    // if (io_submit(sched->ctx, 1, &cbp) < 0) {
-    //     spdlog::error("{} failed to queue aio read {}", *blockJob,
-    //                   strerror(errno));
-    //     schedulerClearBlockCopyJob(sched, sharedState, fileJob, blockJob);
-    //     fileJob->nBlockJobsFinished++;
-    //
-    //     return;
-    // }
+
     blockJob->jobno = fileJob->nBlockJobsScheduled++;
 }
 
@@ -425,25 +421,14 @@ inline void schedulerUpdateBlockCopyJob(CopyScheduler *sched,
             blockJob->type = WRITE;
             io_set_callback(&blockJob->cb, wr_done);
 
-            // blockJob->srcHash = XXH3_128bits(blockJob->data,
-            // blockJob->nbytes);
-            spdlog::trace("{} hash is {:x}{:x}", *blockJob,
-                          blockJob->srcHash.high64, blockJob->srcHash.low64);
+            blockJob->srcHash = XXH3_64bits(blockJob->data, blockJob->nbytes);
+            spdlog::trace("{} hash is {:x}", *blockJob, blockJob->srcHash);
 
             spdlog::trace("{} submitting write request corresponding "
                           "to finished read request",
                           *blockJob);
 
             schedIOSubmitDeferred(sched, &blockJob->cb);
-            // if (io_submit(sched->ctx, 1, &cbp) < 0) {
-            //     spdlog::error("{} failed to enqueue aio write: {}",
-            //     *blockJob,
-            //                   strerror(errno));
-            //     schedulerClearBlockCopyJob(sched, sharedState, fileJob,
-            //                                blockJob);
-            //     fileJob->nBlockJobsScheduled--;
-            //     fileJob->nBlockJobsFinished++;
-            // }
         } else if (blockJob->type == WRITE) {
             spdlog::trace("{} write request finished", *blockJob);
 
@@ -463,28 +448,15 @@ inline void schedulerUpdateBlockCopyJob(CopyScheduler *sched,
                 *blockJob);
 
             schedIOSubmitDeferred(sched, &blockJob->cb);
-            // if (io_submit(sched->ctx, 1, &cbp) < 0) {
-            //     spdlog::error("{} failed to enqueue aio dst readback: {}",
-            //                   *blockJob, strerror(errno));
-            //     schedulerClearBlockCopyJob(sched, sharedState, fileJob,
-            //                                blockJob);
-            //     fileJob->nBlockJobsScheduled--;
-            //     fileJob->nBlockJobsFinished++;
-            // }
         } else {
             spdlog::trace("{} readdst request finished", *blockJob);
 
-            // auto dstHash = XXH3_128bits(blockJob->data, blockJob->nbytes);
-            // spdlog::trace("{} dst hash is {:x}{:x}", *blockJob,
-            // dstHash.high64,
-            //               dstHash.low64);
-            // if (dstHash.high64 != blockJob->srcHash.high64 ||
-            //     dstHash.low64 != blockJob->srcHash.low64) {
-            //     spdlog::error(
-            //         "{} src vs dst hash mismatch {:x}{:x} vs {:x}{:x}",
-            //         *blockJob, blockJob->srcHash.high64,
-            //         blockJob->srcHash.low64, dstHash.high64, dstHash.low64);
-            // }
+            auto dstHash = XXH3_64bits(blockJob->data, blockJob->nbytes);
+            spdlog::trace("{} dst hash is {:x}", *blockJob, dstHash);
+            if (dstHash != blockJob->srcHash) {
+                spdlog::error("{} src vs dst hash mismatch {:x} vs {:x}",
+                              *blockJob, blockJob->srcHash, dstHash, dstHash);
+            }
 
             fileJob->nBlockJobsScheduled--;
             fileJob->nBlockJobsFinished++;
@@ -557,22 +529,6 @@ int schedulerUpdate(CopyScheduler *sched, SharedState *sharedState,
     }
 
     // check for file job completion
-    // for (int i = 0; i < sched->nFileCopyJobs; i++) {
-    //     FileCopyJob *fileJob = &sched->fileCopyJobs[i];
-    //     if (!fileJob->active) {
-    //         continue;
-    //     }
-    //
-    //     if (fileJob->nBlockJobsFinished >=
-    //         blockCount(fileJob->stx.stx_size, fileJob->blockSize)) {
-    //         spdlog::debug("{} finished", *fileJob);
-    //
-    //         sharedState->nFinished++;
-    //
-    //         schedulerClearFileCopyJob(sched, sharedState, fileJob);
-    //     }
-    // }
-
     // schedule new block jobs
     for (int i = 0; i < sched->nFileCopyJobs; i++) {
         FileCopyJob *fileJob = &sched->fileCopyJobs[i];
@@ -640,14 +596,6 @@ int schedulerUpdate(CopyScheduler *sched, SharedState *sharedState,
         return 0;
     }
 
-    // if we have maximum number of i/o's in flight
-    // then wait for one to complete
-    // if (full) {
-    //     rc = io_getevents(ctx, 0, 0, NULL, NULL);
-    //     if (rc < 0)
-    //         spdlog::error("io wait error: {}", strerror(-rc));
-    // }
-    //
     schedulerTick(sched, sharedState);
 
     return EINPROGRESS;
@@ -761,6 +709,7 @@ int processNonDir(const std::string path,
             if (srcFd < 0) {
                 spdlog::error("failed to open src {}: {}\n", remote,
                               strerror(errno));
+                sem_post(&sharedState->fdSem);
                 return 1;
             }
 
@@ -770,19 +719,28 @@ int processNonDir(const std::string path,
             if (dstFd < 0) {
                 spdlog::error("failed to open dest {}: {}", remote,
                               strerror(errno));
+                sem_post(&sharedState->fdSem);
+                close(srcFd);
                 return 1;
             }
+
+#define CLEAN                                                                  \
+    sem_post(&sharedState->fdSem);                                             \
+    close(srcFd);                                                              \
+    close(dstFd)
 
             if (fchownat(destRootFD, partial.c_str(), stx.stx_uid, stx.stx_gid,
                          AT_SYMLINK_NOFOLLOW) < 0) {
                 spdlog::error("failed to fchownat {}: {}", remote,
                               strerror(errno));
+                CLEAN;
                 return 1;
             }
 
             if (ftruncate(dstFd, stx.stx_size)) {
                 spdlog::error("failed to ftruncate {}: {}", remote,
                               strerror(errno));
+                CLEAN;
                 return 1;
             }
 
@@ -790,6 +748,7 @@ int processNonDir(const std::string path,
             if (fstat(dstFd, &destStat) < 0) {
                 spdlog::error("failed to stat destfd {} ({}): {}", dstFd,
                               remote, strerror(errno));
+                CLEAN;
                 return 1;
             }
 
@@ -821,6 +780,7 @@ int processNonDir(const std::string path,
                 spdlog::error("failed to symlinkat {}: {}", remote,
                               strerror(errno));
                 free(contents);
+                sem_post(&sharedState->fdSem);
                 return 1;
             }
 
@@ -833,6 +793,7 @@ int processNonDir(const std::string path,
                                   "to unlink {}: {}",
                                   partial.c_str(), remote, partial.c_str(),
                                   strerror(errno));
+                    sem_post(&sharedState->fdSem);
                     return 1;
                 }
             }
@@ -841,6 +802,7 @@ int processNonDir(const std::string path,
                 0) {
                 spdlog::error("failed to move (linkat) {}->{}: {}",
                               partial.c_str(), remote, strerror(errno));
+                sem_post(&sharedState->fdSem);
                 return 1;
             }
 
@@ -848,6 +810,7 @@ int processNonDir(const std::string path,
                 spdlog::error(
                     "failed to move (unlinkat) {}->{}: failed to unlink {}: {}",
                     partial.c_str(), remote, partial.c_str(), strerror(errno));
+                sem_post(&sharedState->fdSem);
                 return 1;
             }
 
@@ -856,6 +819,7 @@ int processNonDir(const std::string path,
                 0) {
                 spdlog::error("failed to stat symlink {} : {}", remote,
                               strerror(errno));
+                sem_post(&sharedState->fdSem);
                 return 1;
             }
 
@@ -874,7 +838,6 @@ int processNonDir(const std::string path,
 int processDir(const std::string &path, std::optional<dev_t> dev,
                size_t srcRootLen, int srcRootFD, int destRootFD,
                SharedState *sharedState) {
-
     int fd = open(path.c_str(), O_RDONLY);
     auto sharedFD = std::make_shared<FileDescriptor>();
     sharedFD->fd = fd;
@@ -978,7 +941,7 @@ int main(int argc, char *argv[]) {
     SharedState *sharedState = new SharedState;
     sem_init(&sharedState->fdSem, 0, MAX_FILES);
 
-    size_t arena_size = 100UL * (1UL << 30);
+    size_t arena_size = 80UL * (1UL << 30);
     void *buddy_metadata = malloc(buddy_sizeof(arena_size));
     void *buddy_arena;
     posix_memalign(&buddy_arena, 4096, arena_size);
@@ -990,12 +953,12 @@ int main(int argc, char *argv[]) {
     omp_set_nested(1);
     omp_set_max_active_levels(1024);
 
-    const int nScheds = 16; // omp_get_max_threads();
+    const int nScheds = 8; // omp_get_max_threads();
     CopyScheduler *scheds = new CopyScheduler[nScheds];
 
     for (int i = 0; i < nScheds; i++) {
         CopyScheduler &sched = scheds[i];
-        if (createScheduler(&sched, 512, 4)) {
+        if (createScheduler(&sched, 256, 8)) {
             exit(1);
         }
     }
@@ -1035,7 +998,7 @@ int main(int argc, char *argv[]) {
 
                 double now = omp_get_wtime();
                 double delta = now - lastPrint;
-                if (delta > 1.0 || (quit && (size_t)(delta * 1000) > 1.0)) {
+                if (delta > 3.0 || (quit && (size_t)(delta * 1000) > 1.0)) {
                     spdlog::info(
                         "transfered {} files (read {} kbytes/sec, write {} "
                         "kbytes/sec))",
@@ -1089,36 +1052,6 @@ int main(int argc, char *argv[]) {
             {
                 int i = omp_get_thread_num();
                 while (true) {
-
-                    // spdlog::info("update scheduler {} ({})", i,
-                    //              (void *)(sharedState->scheds + i));
-                    if (schedulerUpdate(sharedState->scheds + i, sharedState,
-                                        sharedState->jobQueue) != EINPROGRESS) {
-                        scheds[i].done = true;
-                        break;
-                    }
-                }
-
-                // spdlog::info("scheduler {} finished");
-            }
-
-            spdlog::info("done with {} files", sharedState->nFinished.load());
-        }
-
-#pragma omp section
-        {
-
-            sharedState->bytesWritten = 0;
-            sharedState->bytesRead = 0;
-
-#pragma omp parallel num_threads(sharedState->nscheds)
-            {
-                while (true) {
-
-                    int i = omp_get_thread_num();
-
-                    // spdlog::info("update scheduler {} ({})", i,
-                    //              (void *)(sharedState->scheds + i));
                     if (schedulerUpdate(sharedState->scheds + i, sharedState,
                                         sharedState->jobQueue) != EINPROGRESS) {
                         scheds[i].done = true;
@@ -1130,9 +1063,6 @@ int main(int argc, char *argv[]) {
             spdlog::info("done with {} files", sharedState->nFinished.load());
         }
     }
-
-    // std::cout << "size: " << totalSize << " count: " << totalCount <<
-    // std::endl;
 
     return ret;
 }
