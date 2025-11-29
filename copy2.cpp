@@ -1,7 +1,7 @@
 #include "blockingconcurrentqueue.h"
+#include "bytesize.hh"
 #include "concurrentqueue.h"
 #include "gtl/phmap_fwd_decl.hpp"
-#include "spdlog/cfg/env.h"
 #include "spdlog/common.h"
 #include "spdlog/fmt/bundled/format.h"
 #include "spdlog/sinks/basic_file_sink.h"
@@ -12,19 +12,14 @@
 #include <asm-generic/errno.h>
 #include <atomic>
 #include <cerrno>
-#include <chrono>
-#include <complex>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <dirent.h>
 #include <fcntl.h>
-#include <filesystem>
 #include <gtl/phmap.hpp>
-#include <iostream>
 #include <libaio.h>
 #include <linux/stat.h>
 #include <memory>
@@ -37,7 +32,6 @@
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/sysmacros.h>
-#include <thread>
 #include <unistd.h>
 
 #define BUDDY_ALLOC_IMPLEMENTATION
@@ -104,6 +98,8 @@ static inline int fchmodat_shim(int dirfd, const char *pathname, mode_t mode) {
 
 struct FileCopyJob {
     bool active;
+    bool firstLook;
+    bool actuallyTransferred;
 
     const char *remote;
     const char *partial;
@@ -161,8 +157,8 @@ struct HLinkState {
     // spinlock lock;
     pthread_rwlock_t lock;
 
-    gtl::flat_hash_map<uint64_t, HLinkInfo *> srcToDst;
-    gtl::flat_hash_map<uint64_t, uint64_t> dstToSrc;
+    gtl::parallel_flat_hash_map<uint64_t, HLinkInfo *> srcToDst;
+    gtl::parallel_flat_hash_map<uint64_t, uint64_t> dstToSrc;
 };
 
 struct SharedState {
@@ -172,7 +168,11 @@ struct SharedState {
     HLinkState hlinkState;
     sem_t fdSem;
 
-    std::atomic<size_t> nFinished;
+    std::atomic_size_t nFinished;
+    std::atomic_size_t filesSeen;
+    std::atomic_size_t totalBytesTransferred; // actually transferred + existing
+    std::atomic_size_t totalBytesActuallyTransferred;
+    std::atomic_size_t totalBytesSeen;
     std::atomic_size_t bytesRead;
     std::atomic_size_t bytesWritten;
 
@@ -190,6 +190,9 @@ struct SharedState {
 
     size_t nscheds;
     struct CopyScheduler *scheds;
+
+    int destRootFD;
+    int srcRootFD;
 };
 
 inline size_t blockSize(size_t fsize) {
@@ -226,6 +229,9 @@ template <> struct fmt::formatter<BlockCopyJob> : fmt::formatter<std::string> {
                               my.offset, my.nbytes, (void *)my.data);
     }
 };
+
+// make the bytesize formatter known
+BYTESIZE_FMTLIB_FORMATTER
 
 struct FileDescriptor {
     int fd;
@@ -352,8 +358,8 @@ inline void schedulerClearBlockCopyJob(CopyScheduler *sched,
     if (!nofree) {
         sharedState->allocLock.lock();
         if (blockJob->data) {
-            // buddy_free(sharedState->allocator, blockJob->data);
-            free(blockJob->data);
+            buddy_free(sharedState->allocator, blockJob->data);
+            // free(blockJob->data);
             sharedState->totalMemAllocated -= fileJob->blockSize;
         }
         sharedState->allocLock.unlock();
@@ -422,12 +428,11 @@ inline void schedulerScheduleBlockCopyJob(CopyScheduler *sched,
         fileJob->blockSize, (size_t)fileJob->stx.stx_size - blockJob->offset);
     if (!dataPreallocated) {
         sharedState->allocLock.lock();
-        // void *data = buddy_malloc(sharedState->allocator,
-        // fileJob->blockSize);
-        void *data = NULL;
-        if (sharedState->totalMemAllocated + fileJob->blockSize <
-            (60 * (1ULL << 30)))
-            posix_memalign(&data, 4096, fileJob->blockSize);
+        void *data = buddy_malloc(sharedState->allocator, fileJob->blockSize);
+        // void *data = NULL;
+        // if (sharedState->totalMemAllocated + fileJob->blockSize <
+        //     (60 * (1ULL << 30)))
+        //     posix_memalign(&data, 4096, fileJob->blockSize);
         sharedState->allocLock.unlock();
 
         sharedState->allocationAttempts++;
@@ -549,10 +554,6 @@ inline void schedulerClearFileCopyJob(CopyScheduler *sched,
         }
     }
 
-    // close(fileJob->srcFd);
-    // close(fileJob->dstFd);
-    // sem_post(&sharedState->fdSem);
-
     *fileJob = {};
 }
 
@@ -626,6 +627,7 @@ int schedulerUpdate(
 
             FileCopyJob dupJob = {};
             schedulerShallowDupFileCopyJob(fileJob, &dupJob);
+            dupJob.actuallyTransferred = true;
             sharedState->finishQueue.enqueue(dupJob);
 
             schedulerClearFileCopyJob(sched, sharedState, fileJob);
@@ -666,8 +668,6 @@ int schedulerUpdate(
                 sched->fileCopyJobs[i].active = true;
                 // activeJobs++;
 
-                // break;
-            } else {
                 break;
             }
         } else {
@@ -728,12 +728,15 @@ int processNonDir(const std::string path,
         }
     }
 
+    sharedState->filesSeen++;
+
 reroll:
     shouldTransfer |= memcmp(&stx.stx_mtime, &destStx.stx_mtime,
                              sizeof(stx.stx_mtime)) != 0 ||
                       stx.stx_size != destStx.stx_size;
 
     bool isPendingHardlink = false;
+    bool isFirstLook = false;
 
     if (stx.stx_nlink > 1) {
         pthread_rwlock_rdlock(&sharedState->hlinkState.lock);
@@ -758,12 +761,8 @@ reroll:
                         errno != ENOENT) {
                         spdlog::error("Failed to unlink hardlink dest {}: {}",
                                       remote, strerror(errno));
-                    }
-
-                    if (linkat(destRootFD, linkRoot, destRootFD, remote, 0) <
-                        0) {
-
-                        // raise(SIGTRAP);
+                    } else if (linkat(destRootFD, linkRoot, destRootFD, remote,
+                                      0) < 0) {
                         spdlog::error("Failed to hardlink root {} to {}: {}",
                                       linkRoot, remote, strerror(errno));
                         exit(1);
@@ -787,6 +786,7 @@ reroll:
             // below is not a tautology
             srcHLIt = sharedState->hlinkState.srcToDst.find(stx.stx_ino);
             if (srcHLIt == sharedState->hlinkState.srcToDst.end()) {
+                isFirstLook = true;
 
                 HLinkInfo *phinfo = new HLinkInfo;
                 sharedState->hlinkState.srcToDst[stx.stx_ino] = phinfo;
@@ -820,6 +820,8 @@ reroll:
             }
         }
         pthread_rwlock_unlock(&sharedState->hlinkState.lock);
+    } else {
+        isFirstLook = true;
     }
 
     if (shouldTransfer) {
@@ -828,7 +830,8 @@ reroll:
         if (S_ISREG(stx.stx_mode)) {
 
             sem_wait(&sharedState->fdSem);
-            int srcFd = openat(srcRootFD, remote, O_RDONLY | O_DIRECT);
+            int srcFd =
+                openat(srcRootFD, remote, O_RDONLY | O_DIRECT | O_NOATIME);
             if (srcFd < 0) {
                 spdlog::error("failed to open src {}: {}\n", remote,
                               strerror(errno));
@@ -836,8 +839,9 @@ reroll:
                 return 1;
             }
 
-            int dstFd = openat(destRootFD, partial.c_str(),
-                               O_RDWR | O_CREAT | O_DIRECT, stx.stx_mode);
+            int dstFd =
+                openat(destRootFD, partial.c_str(),
+                       O_RDWR | O_CREAT | O_DIRECT | O_NOATIME, stx.stx_mode);
 
             if (dstFd < 0) {
                 spdlog::error("failed to open dest {}: {}", remote,
@@ -867,7 +871,10 @@ reroll:
                 return 1;
             }
 
+            sharedState->totalBytesSeen += stx.stx_size;
+
             sharedState->jobQueue.enqueue({
+                .firstLook = isFirstLook,
                 .remote = strdup(remote),
                 .partial = strdup(partial.c_str()),
                 .stx = stx,
@@ -875,6 +882,8 @@ reroll:
                 .dstFd = dstFd,
                 .blockSize = blockSize(stx.stx_size),
             });
+
+#undef CLEAN
         } else if (S_ISLNK(stx.stx_mode)) {
 
             // symlinkat(, int tofd, const char *to)
@@ -897,6 +906,7 @@ reroll:
 
             if (!isPendingHardlink) {
                 sharedState->finishQueue.enqueue({
+                    .firstLook = isFirstLook,
                     .remote = strdup(remote),
                     .partial = strdup(partial.c_str()),
                     .stx = stx,
@@ -908,6 +918,7 @@ reroll:
     } else {
         if (!isPendingHardlink) {
             sharedState->finishQueue.enqueue({
+                .firstLook = isFirstLook,
                 .remote = strdup(remote),
                 .partial = NULL,
                 .stx = stx,
@@ -1004,6 +1015,256 @@ int processDir(const std::string &path, std::optional<dev_t> dev,
     return 0;
 }
 
+void finishProcessor(SharedState *sharedState) {
+    while (true) {
+        bool done = true;
+        for (int i = 0; i < sharedState->nscheds; i++) {
+            if (!sharedState->scheds[i].done) {
+                done = false;
+            }
+        }
+
+        FileCopyJob fileJob;
+        while (sharedState->finishQueue.wait_dequeue_timed(fileJob, 100000)) {
+            if (fileJob.srcFd >= 0) {
+                close(fileJob.srcFd);
+            }
+
+            if (fileJob.dstFd >= 0) {
+                close(fileJob.dstFd);
+            }
+
+            if (fileJob.srcFd >= 0 && fileJob.dstFd >= 0) {
+                sem_post(&sharedState->fdSem);
+            }
+
+            struct statx destStx = {};
+            if (statx(sharedState->destRootFD,
+                      fileJob.partial ? fileJob.partial : fileJob.remote,
+                      AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH, STATX_BASIC_STATS,
+                      &destStx) < 0) {
+                spdlog::error("{} failed to stat destination: {} ", fileJob,
+                              strerror(errno));
+            } else if (S_ISREG(fileJob.stx.stx_mode) &&
+                       destStx.stx_size != fileJob.stx.stx_size) {
+                spdlog::error("{} src vs dst size mismatch: {} vs {} ", fileJob,
+                              fileJob.stx.stx_size, destStx.stx_size);
+            } else if (fileJob.nErrors) {
+                spdlog::error("{} failed with {} errors", fileJob,
+                              fileJob.nErrors);
+            } else {
+                if (fileJob.partial &&
+                    (spdlog::trace("{} finish queue unlinking {}", fileJob,
+                                   fileJob.remote),
+                     unlinkat(sharedState->destRootFD, fileJob.remote, 0)) <
+                        0 &&
+                    errno != ENOENT) {
+                    spdlog::warn("{} failed to delete existing remote {} ",
+                                 fileJob, strerror(errno));
+                }
+
+                struct timespec times[] = {
+                    {.tv_nsec = UTIME_OMIT},
+                    {.tv_sec = fileJob.stx.stx_mtime.tv_sec,
+                     .tv_nsec = fileJob.stx.stx_mtime.tv_nsec},
+                };
+
+                bool fileJobSuccess = true;
+
+                if (fileJob.partial &&
+                    (spdlog::trace("{} finish queue linking "
+                                   "partial to remote {} -> {}",
+                                   fileJob, fileJob.partial, fileJob.remote),
+                     renameat(sharedState->destRootFD, fileJob.partial,
+                              sharedState->destRootFD, fileJob.remote) < 0)) {
+                    spdlog::error("{} failed to perform partial to "
+                                  "remote link {} -> {}: {} ",
+                                  fileJob, fileJob.partial, fileJob.remote,
+                                  strerror(errno));
+                    fileJobSuccess = false;
+                } else if ((destStx.stx_mtime.tv_sec !=
+                            fileJob.stx.stx_mtime.tv_sec) &&
+                           utimensat(sharedState->destRootFD, fileJob.remote,
+                                     times,
+                                     AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) < 0) {
+                    spdlog::error("{} failed to set modification times : {} ",
+                                  fileJob, strerror(errno));
+                    fileJobSuccess = false;
+                } else if ((destStx.stx_mode != fileJob.stx.stx_mode) &&
+                           fchmodat_shim(sharedState->destRootFD,
+                                         fileJob.remote,
+                                         fileJob.stx.stx_mode) < 0) {
+                    spdlog::error("{} failed to set mode: {} ", fileJob,
+                                  strerror(errno));
+                    fileJobSuccess = false;
+                } else if ((destStx.stx_uid != fileJob.stx.stx_uid ||
+                            destStx.stx_gid != fileJob.stx.stx_gid) &&
+                           fchownat(sharedState->destRootFD, fileJob.remote,
+                                    fileJob.stx.stx_gid, fileJob.stx.stx_uid,
+                                    AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) < 0) {
+                    spdlog::error("{} failed to chown: {} ", fileJob,
+                                  strerror(errno));
+                    fileJobSuccess = false;
+
+                } else if (fileJob.stx.stx_nlink > 1) {
+                    pthread_rwlock_rdlock(&sharedState->hlinkState.lock);
+                    auto it = sharedState->hlinkState.srcToDst.find(
+                        fileJob.stx.stx_ino);
+
+                    bool notend = false;
+                    HLinkInfo *phlstate = NULL;
+                    if (it != sharedState->hlinkState.srcToDst.end()) {
+                        it->second->lock.lock();
+                        it->second->transferred = true;
+                        it->second->destInode = destStx.stx_ino;
+                        phlstate = it->second;
+                        it->second->lock.unlock();
+
+                        pthread_rwlock_unlock(&sharedState->hlinkState.lock);
+                        pthread_rwlock_wrlock(
+                            &sharedState->hlinkState.lock); // promote read lock
+                        sharedState->hlinkState.dstToSrc[destStx.stx_ino] =
+                            fileJob.stx.stx_ino;
+
+                        notend = true;
+                    }
+
+                    pthread_rwlock_unlock(&sharedState->hlinkState.lock);
+
+                    if (notend) {
+                        phlstate->lock.lock();
+                        for (auto &tgt : phlstate->links) {
+                            spdlog::trace("{} finish queue performing "
+                                          "pending link {} -> {}",
+                                          fileJob, fileJob.remote, tgt.c_str());
+
+                            if (unlinkat(sharedState->destRootFD, tgt.c_str(),
+                                         0) < 0 &&
+                                errno != ENOENT) {
+                                spdlog::error("{} failed to unlink "
+                                              "{} to apply "
+                                              "pending: {}",
+                                              fileJob, tgt.c_str(),
+                                              strerror(errno));
+                            }
+
+                            if (linkat(sharedState->destRootFD, fileJob.remote,
+                                       sharedState->destRootFD, tgt.c_str(),
+                                       0) < 0) {
+                                spdlog::error("{} failed to perform pending"
+                                              " link {} -> {} : {}",
+                                              fileJob, fileJob.remote,
+                                              tgt.c_str(), strerror(errno));
+                            }
+                            sharedState->nFinished++;
+                        }
+                        phlstate->lock.unlock();
+                    }
+                }
+
+                if (S_ISREG(fileJob.stx.stx_mode) && fileJobSuccess &&
+                    fileJob.firstLook) {
+                    sharedState->totalBytesTransferred += fileJob.stx.stx_size;
+
+                    if (fileJob.actuallyTransferred) {
+                        sharedState->totalBytesActuallyTransferred +=
+                            fileJob.stx.stx_size;
+                    }
+                }
+            }
+
+            sharedState->nFinished++;
+
+            if (fileJob.remote) {
+                free((void *)fileJob.remote);
+            }
+
+            if (fileJob.partial) {
+                free((void *)fileJob.partial);
+            }
+        }
+
+        if (done)
+            break;
+    }
+}
+
+void incrementalLogger(SharedState *sharedState) {
+    double lastPrint = omp_get_wtime();
+    bool quit = false;
+    while (true) {
+        bool done = true;
+        for (int i = 0; i < sharedState->nscheds; i++) {
+            if (!sharedState->scheds[i].done) {
+                done = false;
+            }
+        }
+
+        if (done)
+            break;
+
+        double now = omp_get_wtime();
+        double delta = now - lastPrint;
+        if (delta > 3.0 || (quit && (size_t)(delta * 1000) > 1.0)) {
+            spdlog::info(
+                "transferred {}/{} files, {}({})/{} (read {}/s, "
+                "write {}/s)",
+                sharedState->nFinished.load(), sharedState->filesSeen.load(),
+                bytesize::bytesize{sharedState->totalBytesTransferred.load()},
+                bytesize::bytesize{
+                    sharedState->totalBytesActuallyTransferred.load()},
+                bytesize::bytesize{sharedState->totalBytesSeen.load()},
+                bytesize::bytesize{(size_t)((double)sharedState->bytesRead.load() / delta)},
+                bytesize::bytesize{(size_t)((double)sharedState->bytesWritten.load() / delta)});
+
+            spdlog::info("\tallocation failures {}/{}",
+                         sharedState->allocationFailures.load(),
+                         sharedState->allocationAttempts.load());
+            spdlog::info("\tqueue left {}",
+                         sharedState->jobQueue.size_approx());
+            spdlog::info("\ttotal allocated {}KB",
+                         sharedState->totalMemAllocated.load() / 1024);
+            spdlog::info("\tscheduler iterations {}",
+                         sharedState->schedulerIterations.load());
+
+            // for (int i = 0; i < nScheds; i++) {
+            //     size_t nFActive = 0;
+            //     size_t nBActive = 0;
+            //     for (int j = 0; j < scheds[i].nFileCopyJobs; j++) {
+            //         nFActive +=
+            //             (size_t)(scheds[i].fileCopyJobs[j].active);
+            //     }
+            //
+            //     for (int j = 0;
+            //          j < scheds[i].nBlockCopyJobsPerFileCopyJob *
+            //                  scheds[i].nFileCopyJobs;
+            //          j++) {
+            //         nBActive +=
+            //             (size_t)(scheds[i].blockCopyJobs[j].inUse);
+            //     }
+            //
+            //     spdlog::info("\tsched{}: {}/{}f, {}/{}b", i,
+            //     nFActive,
+            //                  scheds[i].nFileCopyJobs, nBActive,
+            //                  scheds[i].nBlockCopyJobsPerFileCopyJob *
+            //                      scheds[i].nFileCopyJobs);
+            // }
+
+            sharedState->bytesWritten = 0;
+            sharedState->bytesRead = 0;
+            sharedState->allocationAttempts = 0;
+            sharedState->allocationFailures = 0;
+            sharedState->schedulerIterations = 0;
+            lastPrint = omp_get_wtime();
+        }
+
+        if (quit) {
+            spdlog::info("done: {}", delta);
+            break;
+        }
+    }
+}
+
 int main(int argc, char *argv[]) {
     auto err_logger = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();
     err_logger->set_level(spdlog::level::info);
@@ -1014,7 +1275,7 @@ int main(int argc, char *argv[]) {
     file_sink->set_level(spdlog::level::trace);
 
     auto logger = std::make_shared<spdlog::logger>(
-        spdlog::logger("copy2", {err_logger, file_sink}));
+        spdlog::logger("copy2", {err_logger/*, file_sink*/}));
     logger->set_level(spdlog::level::trace);
     spdlog::set_default_logger(logger);
 
@@ -1026,13 +1287,13 @@ int main(int argc, char *argv[]) {
     const char *root = argv[1];
     const char *dest = argv[2];
 
-    int destRootFD = open(dest, O_DIRECTORY | O_RDONLY);
+    int destRootFD = open(dest, O_DIRECTORY | O_RDONLY | O_NOATIME);
     if (destRootFD < 0) {
         spdlog::error("failed to open destination: {}", strerror(errno));
         return 1;
     }
 
-    int srcRootFD = open(root, O_DIRECTORY | O_RDONLY);
+    int srcRootFD = open(root, O_DIRECTORY | O_RDONLY | O_NOATIME);
     if (srcRootFD < 0) {
         spdlog::error("failed to open source: {}", strerror(errno));
         return 1;
@@ -1055,7 +1316,7 @@ int main(int argc, char *argv[]) {
                              (unsigned char *)buddy_arena, arena_size, 4096);
 
     omp_set_nested(1);
-    omp_set_max_active_levels(8192);
+    omp_set_max_active_levels(INT32_MAX);
 
     const int nScheds = 8; // omp_get_max_threads();
     CopyScheduler *scheds = new CopyScheduler[nScheds];
@@ -1070,6 +1331,9 @@ int main(int argc, char *argv[]) {
     sharedState->scheds = scheds;
     sharedState->nscheds = nScheds;
 
+    sharedState->destRootFD = destRootFD;
+    sharedState->srcRootFD = srcRootFD;
+
     int ret = 0;
 #pragma omp parallel sections
     {
@@ -1083,266 +1347,14 @@ int main(int argc, char *argv[]) {
 
 #pragma omp section
         {
-            double lastPrint = omp_get_wtime();
-            bool quit = false;
-            while (true) {
-                bool done = true;
-                for (int i = 0; i < sharedState->nscheds; i++) {
-                    if (!sharedState->scheds[i].done) {
-                        done = false;
-                    }
-                }
-
-                if (done)
-                    break;
-
-                double now = omp_get_wtime();
-                double delta = now - lastPrint;
-                if (delta > 3.0 || (quit && (size_t)(delta * 1000) > 1.0)) {
-                    spdlog::info(
-                        "transfered {} files (read {} kbytes/sec, write {} "
-                        "kbytes/sec))",
-                        sharedState->nFinished.load(),
-                        ((sharedState->bytesRead.load() / 1024) * 1000) /
-                            (size_t)(delta * 1000),
-                        ((sharedState->bytesWritten.load() / 1024) * 1000) /
-                            (size_t)(delta * 1000));
-
-                    spdlog::info("\tallocation failures {}/{}",
-                                 sharedState->allocationFailures.load(),
-                                 sharedState->allocationAttempts.load());
-                    spdlog::info("\tqueue left {}",
-                                 sharedState->jobQueue.size_approx());
-                    spdlog::info("\ttotal allocated {}KB",
-                                 sharedState->totalMemAllocated.load() / 1024);
-                    spdlog::info("\tscheduler iterations {}",
-                                 sharedState->schedulerIterations.load());
-
-                    // for (int i = 0; i < nScheds; i++) {
-                    //     size_t nFActive = 0;
-                    //     size_t nBActive = 0;
-                    //     for (int j = 0; j < scheds[i].nFileCopyJobs; j++) {
-                    //         nFActive +=
-                    //             (size_t)(scheds[i].fileCopyJobs[j].active);
-                    //     }
-                    //
-                    //     for (int j = 0;
-                    //          j < scheds[i].nBlockCopyJobsPerFileCopyJob *
-                    //                  scheds[i].nFileCopyJobs;
-                    //          j++) {
-                    //         nBActive +=
-                    //             (size_t)(scheds[i].blockCopyJobs[j].inUse);
-                    //     }
-                    //
-                    //     spdlog::info("\tsched{}: {}/{}f, {}/{}b", i,
-                    //     nFActive,
-                    //                  scheds[i].nFileCopyJobs, nBActive,
-                    //                  scheds[i].nBlockCopyJobsPerFileCopyJob *
-                    //                      scheds[i].nFileCopyJobs);
-                    // }
-
-                    sharedState->bytesWritten = 0;
-                    sharedState->bytesRead = 0;
-                    sharedState->allocationAttempts = 0;
-                    sharedState->allocationFailures = 0;
-                    sharedState->schedulerIterations = 0;
-                    lastPrint = omp_get_wtime();
-                }
-
-                if (quit) {
-                    spdlog::info("done: {}", delta);
-                    break;
-                }
-            }
+            incrementalLogger(sharedState);
         }
 
 #pragma omp section
         {
 #pragma omp parallel num_threads(128)
             {
-                while (true) {
-                    bool done = true;
-                    for (int i = 0; i < sharedState->nscheds; i++) {
-                        if (!sharedState->scheds[i].done) {
-                            done = false;
-                        }
-                    }
-
-                    FileCopyJob fileJob;
-                    while (sharedState->finishQueue.wait_dequeue_timed(
-                        fileJob, 100000)) {
-                        if (fileJob.srcFd >= 0) {
-                            close(fileJob.srcFd);
-                        }
-
-                        if (fileJob.dstFd >= 0) {
-                            close(fileJob.dstFd);
-                        }
-
-                        if (fileJob.srcFd >= 0 && fileJob.dstFd >= 0) {
-                            sem_post(&sharedState->fdSem);
-                        }
-
-                        struct statx destStx = {};
-                        if (statx(destRootFD,
-                                  fileJob.partial ? fileJob.partial
-                                                  : fileJob.remote,
-                                  AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH,
-                                  STATX_BASIC_STATS, &destStx) < 0) {
-                            spdlog::error("{} failed to stat destination: {} ",
-                                          fileJob, strerror(errno));
-                        } else if (S_ISREG(fileJob.stx.stx_mode) &&
-                                   destStx.stx_size != fileJob.stx.stx_size) {
-                            spdlog::error(
-                                "{} src vs dst size mismatch: {} vs {} ",
-                                fileJob, fileJob.stx.stx_size,
-                                destStx.stx_size);
-                        } else if (fileJob.nErrors) {
-                            spdlog::error("{} failed with {} errors", fileJob,
-                                          fileJob.nErrors);
-                        } else {
-                            if (fileJob.partial &&
-                                (spdlog::trace("{} finish queue unlinking {}",
-                                               fileJob, fileJob.remote),
-                                 unlinkat(destRootFD, fileJob.remote, 0)) < 0 &&
-                                errno != ENOENT) {
-                                spdlog::warn(
-                                    "{} failed to delete existing remote {} ",
-                                    fileJob, strerror(errno));
-                            }
-
-                            struct timespec times[] = {
-                                {.tv_nsec = UTIME_OMIT},
-                                {.tv_sec = fileJob.stx.stx_mtime.tv_sec,
-                                 .tv_nsec = fileJob.stx.stx_mtime.tv_nsec},
-                            };
-
-                            if (fileJob.partial &&
-                                (spdlog::trace("{} finish queue linking "
-                                               "partial to remote {} -> {}",
-                                               fileJob, fileJob.partial,
-                                               fileJob.remote),
-                                 renameat(destRootFD, fileJob.partial,
-                                          destRootFD, fileJob.remote) < 0)) {
-                                spdlog::error("{} failed to perform partial to "
-                                              "remote link {} -> {}: {} ",
-                                              fileJob, fileJob.partial,
-                                              fileJob.remote, strerror(errno));
-                            } else if ((destStx.stx_mtime.tv_sec !=
-                                        fileJob.stx.stx_mtime.tv_sec) &&
-                                       utimensat(destRootFD, fileJob.remote,
-                                                 times,
-                                                 AT_SYMLINK_NOFOLLOW |
-                                                     AT_EMPTY_PATH) < 0) {
-                                spdlog::error(
-                                    "{} failed to set modification times : {} ",
-                                    fileJob, strerror(errno));
-                            } else if ((destStx.stx_mode !=
-                                        fileJob.stx.stx_mode) &&
-                                       fchmodat_shim(destRootFD, fileJob.remote,
-                                                     fileJob.stx.stx_mode) <
-                                           0) {
-                                spdlog::error("{} failed to set mode: {} ",
-                                              fileJob, strerror(errno));
-                            } else if ((destStx.stx_uid !=
-                                            fileJob.stx.stx_uid ||
-                                        destStx.stx_gid !=
-                                            fileJob.stx.stx_gid) &&
-                                       fchownat(destRootFD, fileJob.remote,
-                                                fileJob.stx.stx_gid,
-                                                fileJob.stx.stx_uid,
-                                                AT_SYMLINK_NOFOLLOW |
-                                                    AT_EMPTY_PATH) < 0) {
-                                spdlog::error("{} failed to chown: {} ",
-                                              fileJob, strerror(errno));
-
-                            } else if (fileJob.stx.stx_nlink > 1) {
-                                pthread_rwlock_rdlock(
-                                    &sharedState->hlinkState.lock);
-                                auto it = sharedState->hlinkState.srcToDst.find(
-                                    fileJob.stx.stx_ino);
-
-                                bool notend = false;
-                                HLinkInfo *phlstate = NULL;
-                                if (it !=
-                                    sharedState->hlinkState.srcToDst.end()) {
-                                    it->second->lock.lock();
-                                    it->second->transferred = true;
-                                    it->second->destInode = destStx.stx_ino;
-                                    phlstate = it->second;
-                                    it->second->lock.unlock();
-
-                                    pthread_rwlock_unlock(
-                                        &sharedState->hlinkState.lock);
-                                    pthread_rwlock_wrlock(
-                                        &sharedState->hlinkState
-                                             .lock); // promote read lock
-                                    sharedState->hlinkState
-                                        .dstToSrc[destStx.stx_ino] =
-                                        fileJob.stx.stx_ino;
-
-                                    notend = true;
-                                }
-
-                                pthread_rwlock_unlock(
-                                    &sharedState->hlinkState.lock);
-
-                                if (notend) {
-                                    phlstate->lock.lock();
-                                    for (auto &tgt : phlstate->links) {
-                                        spdlog::trace(
-                                            "{} finish queue performing "
-                                            "pending link {} -> {}",
-                                            fileJob, fileJob.remote,
-                                            tgt.c_str());
-
-                                        if (unlinkat(destRootFD, tgt.c_str(),
-                                                     0) < 0 &&
-                                            errno != ENOENT) {
-                                            spdlog::error("{} failed to unlink "
-                                                          "{} to apply "
-                                                          "pending: {}",
-                                                          fileJob, tgt.c_str(),
-                                                          strerror(errno));
-                                        }
-
-                                        if (linkat(destRootFD, fileJob.remote,
-                                                   destRootFD, tgt.c_str(),
-                                                   0) < 0) {
-                                            spdlog::error(
-                                                "{} failed to perform pending"
-                                                " link {} -> {} : {}",
-                                                fileJob, fileJob.remote,
-                                                tgt.c_str(), strerror(errno));
-                                        }
-                                        sharedState->nFinished++;
-                                    }
-                                    phlstate->lock.unlock();
-                                }
-                            }
-                        }
-
-                        // if (fileJob.partial &&
-                        //     unlinkat(destRootFD, fileJob.partial, 0) < 0) {
-                        //     spdlog::warn(
-                        //         "{} failed to delete existing partial {}",
-                        //         fileJob, strerror(errno));
-                        // }
-
-                        sharedState->nFinished++;
-
-                        if (fileJob.remote) {
-                            free((void *)fileJob.remote);
-                        }
-
-                        if (fileJob.partial) {
-                            free((void *)fileJob.partial);
-                        }
-                    }
-
-                    if (done)
-                        break;
-                }
+                finishProcessor(sharedState);
             }
 
             spdlog::info("done with {} files", sharedState->nFinished.load());
@@ -1368,7 +1380,8 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    spdlog::info("copying finished in {}s", (size_t)(omp_get_wtime() - starttime));
+    spdlog::info("copying finished in {}s",
+                 (size_t)(omp_get_wtime() - starttime));
 
     return ret;
 }
