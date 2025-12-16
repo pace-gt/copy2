@@ -1195,6 +1195,8 @@ int processDir(StringPartRef path, std::optional<dev_t> dev, size_t srcRootLen,
         return -1;
     }
 
+    sharedState->filesSeen++;
+
     struct dirent *d;
     while ((d = readdir(dir))) {
         if (ISDOT(d->d_name)) {
