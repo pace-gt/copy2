@@ -7,6 +7,7 @@
 #include "spdlog/sinks/basic_file_sink.h"
 #include "spdlog/sinks/stdout_color_sinks.h"
 #include "spdlog/spdlog.h"
+#include "stringallocator.h"
 #include "xxh_x86dispatch.h"
 #include <algorithm>
 #include <asm-generic/errno.h>
@@ -52,35 +53,6 @@ struct QueueTraits : public moodycamel::ConcurrentQueueDefaultTraits {
     static const size_t BLOCK_SIZE = 8192; // Use bigger blocks
 };
 
-// https://rigtorp.se/spinlock
-struct spinlock {
-    std::atomic<bool> lock_ = {0};
-
-    void lock() noexcept {
-        for (;;) {
-            // Optimistically assume the lock is free on the first try
-            if (!lock_.exchange(true, std::memory_order_acquire)) {
-                return;
-            }
-            // Wait for lock to be released without generating cache misses
-            while (lock_.load(std::memory_order_relaxed)) {
-                // Issue X86 PAUSE or ARM YIELD instruction to reduce contention
-                // between hyper-threads
-                __builtin_ia32_pause();
-            }
-        }
-    }
-
-    bool try_lock() noexcept {
-        // First do a relaxed load to check if lock is free in order to prevent
-        // unnecessary cache misses if someone does while(!try_lock())
-        return !lock_.load(std::memory_order_relaxed) &&
-               !lock_.exchange(true, std::memory_order_acquire);
-    }
-
-    void unlock() noexcept { lock_.store(false, std::memory_order_release); }
-};
-
 // AT_EMPTY_PATH and AT_SYMLINK_NOFOLLOW on fchmodat is only supported on kernel
 // versions >= 6.6 So here's a shim. I too am a kernel hacker
 static inline int fchmodat_shim(int dirfd, const char *pathname, mode_t mode) {
@@ -96,13 +68,162 @@ static inline int fchmodat_shim(int dirfd, const char *pathname, mode_t mode) {
     return fchmodat(dirfd, pathname, mode, 0);
 }
 
+// const size_t STRING_PART_MAX_LEN = 64 - sizeof(AllocRef) - 1;
+typedef AllocRef StringPartRef;
+struct StringPart {
+    std::atomic_size_t rc;
+    size_t len;
+    StringPartRef prev;
+    char data[];
+};
+
+#define STRING_PART_RC_INC(alloc, ref)                                         \
+    (((StringPart *)allocDeref(alloc, ref))->rc++, ref)
+
+const char *stringrefImmediateToCString(Allocator *alloc, StringPartRef ref);
+inline void stringPartRelease(Allocator *alloc, StringPartRef s) {
+    StringPart *part;
+    StringPartRef curRef = s;
+    size_t i = 0;
+    while (!isNullRef(s) && (part = (StringPart *)allocDeref(alloc, curRef))) {
+        i++;
+        size_t rc = part->rc--;
+        if (!rc) {
+            spdlog::error("rc is zero: {}, it {}",
+                          stringrefImmediateToCString(alloc, s), i);
+        }
+        assert(rc);
+
+        AllocRef sTemp = curRef;
+        curRef = part->prev;
+        if (rc <= 1) {
+            AllocatorFree(alloc, sTemp);
+        } else {
+            break;
+        }
+    }
+}
+
+struct StringPartGuard {
+    Allocator *alloc;
+    StringPartRef ref;
+
+    ~StringPartGuard() {
+        if (!isNullRef(ref))
+            stringPartRelease(alloc, ref);
+    }
+};
+// static_assert(sizeof(StringPart) == 64, "StringPart size must be 64");
+
+size_t stringRefMemcpy(const Allocator *alloc, StringPartRef ref, char *buf,
+                       size_t bufsize) {
+    size_t size = 0;
+
+    StringPartRef cur = ref;
+
+    if (isNullRef(cur)) {
+        size++;
+        if (bufsize) {
+            buf[0] = '\0';
+        }
+
+        return 1;
+    }
+
+    while (!isNullRef(cur)) {
+        StringPart *part = (StringPart *)allocDeref(alloc, cur);
+        size += part->len;
+
+        cur = part->prev;
+    }
+    size++;
+
+    if (bufsize < size) {
+        return size;
+    }
+
+    size_t it = 0;
+    cur = ref;
+    if (buf) {
+        while (!isNullRef(cur)) {
+            StringPart *part = (StringPart *)allocDeref(alloc, cur);
+            it += part->len;
+
+            // fprintf(stderr, "memcpy %.*s, %zu\n", (int)part->len, part->data,
+            // size - it - 1);
+            memcpy(buf + size - it - 1, part->data, part->len);
+
+            cur = part->prev;
+        }
+
+        buf[size - 1] = '\0';
+    }
+
+    // spdlog::info("size is {}", size);
+
+    return size;
+}
+
+int stringrefMemcpyWithRealloc(Allocator *alloc, StringPartRef ref,
+                               AllocRef *buf, size_t *bufsize) {
+    size_t len =
+        stringRefMemcpy(alloc, ref, (char *)allocDeref(alloc, *buf), *bufsize);
+    if (len >= *bufsize) {
+        *bufsize = len;
+        AllocatorFree(alloc, *buf);
+        *buf = AllocatorAllocate(alloc, *bufsize);
+
+        if (len !=
+            stringRefMemcpy(alloc, ref, (char *)allocDeref(alloc, *buf), len)) {
+            return 1;
+        }
+    }
+
+    // fprintf(stderr, "result: %s\n", (char *)allocDeref(alloc, *buf));
+
+    return 0;
+}
+
+StringPartRef toStringPart(Allocator *alloc, StringPartRef currentTip,
+                           const char *s1, size_t len1, const char *s2,
+                           size_t len2) {
+    if (!isNullRef(currentTip)) {
+        StringPart *prevPart = (StringPart *)allocDeref(alloc, currentTip);
+        STRING_PART_RC_INC(alloc, currentTip);
+    }
+    // prevPart->rc++;
+
+    StringPartRef cur =
+        AllocatorAllocate(alloc, sizeof(StringPart) + len1 + len2);
+
+    StringPart *part = (StringPart *)allocDeref(alloc, cur);
+    part->len = len1 + len2;
+    memcpy(part->data, s1, len1);
+    if (len2) {
+        memcpy(part->data + len1, s2, len2);
+    }
+    part->rc = 1;
+    part->prev = currentTip;
+
+    return cur;
+}
+
+const char *stringrefImmediateToCString(Allocator *alloc, StringPartRef ref) {
+    thread_local size_t bufSize = PATH_MAX;
+    thread_local AllocRef remoteBuf = AllocatorAllocate(alloc, bufSize);
+
+    stringrefMemcpyWithRealloc(alloc, ref, &remoteBuf, &bufSize);
+
+    return (const char *)allocDeref(alloc, remoteBuf);
+}
+
 struct FileCopyJob {
     bool active;
     bool firstLook;
     bool actuallyTransferred;
 
-    const char *remote;
-    const char *partial;
+    StringPartRef remote;
+    StringPartRef partial;
 
     struct statx stx;
 
@@ -144,14 +265,34 @@ struct BlockCopyJob {
     XXH64_hash_t srcHash;
 };
 
+typedef AllocRef LinkEntryRef;
+struct LinkEntry {
+    StringPartRef link;
+    LinkEntryRef prev;
+};
+
 struct HLinkInfo {
     spinlock lock;
 
     bool transferred;
     uint64_t destInode;
-    std::string remote;
-    std::vector<std::string> links;
+
+    StringPartRef remote;
+    LinkEntryRef links;
 };
+
+inline LinkEntryRef linkEntryAppend(Allocator *alloc, LinkEntryRef tip,
+                                    LinkEntryRef next) {
+    assert(!isNullRef(next));
+    if (isNullRef(tip)) {
+        ((LinkEntry *)allocDeref(alloc, next))->prev = {};
+        return next;
+    }
+
+    ((LinkEntry *)allocDeref(alloc, next))->prev = tip;
+
+    return next;
+}
 
 struct HLinkState {
     // spinlock lock;
@@ -186,7 +327,9 @@ struct SharedState {
     std::atomic<int> crawlDone;
 
     spinlock allocLock;
-    buddy *allocator;
+    buddy *copybufferAllocator;
+
+    Allocator *alloc;
 
     size_t nscheds;
     struct CopyScheduler *scheds;
@@ -194,6 +337,8 @@ struct SharedState {
     int destRootFD;
     int srcRootFD;
 };
+
+Allocator *globalAllocator;
 
 inline size_t blockSize(size_t fsize) {
     return std::max(
@@ -213,7 +358,12 @@ template <> struct fmt::formatter<FileCopyJob> : fmt::formatter<std::string> {
             ctx.out(),
             "[FileCopyJob remote={}, partial={}, "
             "fileSize={}, blockSize={}, nScheduled={}, nFinished={}/{}]",
-            my.remote ? my.remote : "NULL", my.partial ? my.partial : "NULL",
+            !isNullRef(my.remote)
+                ? stringrefImmediateToCString(globalAllocator, my.remote)
+                : "NULL",
+            !isNullRef(my.partial)
+                ? stringrefImmediateToCString(globalAllocator, my.partial)
+                : "NULL",
             my.stx.stx_size, my.blockSize, my.nBlockJobsScheduled,
             my.nBlockJobsFinished, blockCount(my.stx.stx_size, my.blockSize));
     }
@@ -243,38 +393,40 @@ struct FileDescriptor {
  * Arbitrary length readlink
  * @param path Path to symlink
  * relative to that. Otherwise, set to -1
- * @return path (or NULL if error). Please free when done
+ * @return path (or NULL if error), stored in thread local buffer.
  */
-char *readSymlink(const char *path) {
-    size_t size = INITIAL_READLINK_BUF_SIZE;
-    char *buf = NULL;
+char *readSymlink(Allocator *alloc, int srcFD, const char *path) {
+    thread_local size_t size = INITIAL_READLINK_BUF_SIZE;
+    thread_local AllocRef readlinkBuf = AllocatorAllocate(alloc, size);
+
+    char *bufPtr = (char *)allocDeref(alloc, readlinkBuf);
     ssize_t nread = 0;
     while (1) {
-        buf = (char *)reallocarray(buf, size, 1);
-
-        nread = readlink(path, buf, size);
+        nread = readlinkat(srcFD, path, bufPtr, size);
 
         if (nread < 0) {
             fprintf(stderr,
                     "ERROR: readlink failed to read symlink \"%s\" "
                     "(errorcode %ld)\n",
                     path, errno);
-            free(buf);
             return nullptr;
         } else if (nread == 0) {
-            buf[0] = '\0';
+            bufPtr[0] = '\0';
             break;
         }
 
         if (nread >= size) {
             size += INITIAL_READLINK_BUF_SIZE;
+            AllocatorFree(alloc, readlinkBuf);
+            readlinkBuf = AllocatorAllocate(alloc, size);
+            char *bufPtr = (char *)allocDeref(alloc, readlinkBuf);
         } else {
-            buf[nread] = '\0';
+            bufPtr[nread] = '\0';
             break;
         }
     }
 
-    return buf;
+    return bufPtr;
 }
 
 static void wr_done(io_context_t ctx, struct iocb *iocb, long res, long res2) {
@@ -358,7 +510,7 @@ inline void schedulerClearBlockCopyJob(CopyScheduler *sched,
     if (!nofree) {
         sharedState->allocLock.lock();
         if (blockJob->data) {
-            buddy_free(sharedState->allocator, blockJob->data);
+            buddy_free(sharedState->copybufferAllocator, blockJob->data);
             // free(blockJob->data);
             sharedState->totalMemAllocated -= fileJob->blockSize;
         }
@@ -428,7 +580,8 @@ inline void schedulerScheduleBlockCopyJob(CopyScheduler *sched,
         fileJob->blockSize, (size_t)fileJob->stx.stx_size - blockJob->offset);
     if (!dataPreallocated) {
         sharedState->allocLock.lock();
-        void *data = buddy_malloc(sharedState->allocator, fileJob->blockSize);
+        void *data =
+            buddy_malloc(sharedState->copybufferAllocator, fileJob->blockSize);
         // void *data = NULL;
         // if (sharedState->totalMemAllocated + fileJob->blockSize <
         //     (60 * (1ULL << 30)))
@@ -690,27 +843,55 @@ int schedulerUpdate(
     return EINPROGRESS;
 }
 
-int processNonDir(const std::string path,
-                  std::shared_ptr<FileDescriptor> parentFD,
-                  std::optional<dev_t> dev, size_t srcRootLen, int srcRootFD,
-                  int destRootFD, SharedState *sharedState) {
+int processNonDir(StringPartRef path, std::optional<dev_t> dev,
+                  size_t srcRootLen, int srcRootFD, int destRootFD,
+                  SharedState *sharedState) {
+    StringPartGuard pathGuard{sharedState->alloc, path};
 
-    const char *remote = path.c_str() + srcRootLen;
-    if (remote[0] == '/') {
-        remote++;
-    }
+    assert(!isNullRef(path));
 
-    std::string partial =
-        fmt::format("{}{:016X}.partial", remote,
-                    XXH3_64bits_withSeed(remote, strlen(remote), 0));
+    thread_local size_t remoteBufSize = PATH_MAX;
+    thread_local AllocRef remoteBuf =
+        AllocatorAllocate(sharedState->alloc, remoteBufSize);
+
+    thread_local size_t partialBufSize = PATH_MAX;
+    thread_local AllocRef partialBuf =
+        AllocatorAllocate(sharedState->alloc, remoteBufSize);
+
+    int ok = (!stringrefMemcpyWithRealloc(sharedState->alloc, path, &remoteBuf,
+                                          &remoteBufSize));
+    assert(ok);
+
+    size_t suffixBufLen = 16 + std::strlen(".partial");
+    char suffixBuf[suffixBufLen]; // if your compiler turns this into a vla,
+                                  // resconsider life
+
+    const char *remote =
+        (const char *)allocDeref(sharedState->alloc, remoteBuf);
+
+    snprintf(suffixBuf, suffixBufLen, "%016lX.partial",
+             XXH3_64bits_withSeed(remote, strlen(remote), 0));
+
+    StringPart *pathPart = (StringPart *)allocDeref(sharedState->alloc, path);
+    StringPartRef partialRef =
+        toStringPart(sharedState->alloc, pathPart->prev, pathPart->data,
+                     pathPart->len, suffixBuf, suffixBufLen);
+    StringPartGuard partialRefGuard{sharedState->alloc, partialRef};
+    ok = (!stringrefMemcpyWithRealloc(sharedState->alloc, partialRef,
+                                      &partialBuf, &partialBufSize));
+    assert(ok);
+
+    const char *partial =
+        (const char *)allocDeref(sharedState->alloc, partialBuf);
 
     bool shouldTransfer = false;
     bool exists = true;
 
     struct statx stx;
-    if (statx(AT_FDCWD, path.c_str(), AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS,
-              &stx) < 0) {
+    if (statx(srcRootFD, remote, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &stx) <
+        0) {
         spdlog::error("Failed to statx src {}: {}\n", remote, strerror(errno));
+        assert(false);
         return 1;
     }
 
@@ -722,6 +903,7 @@ int processNonDir(const std::string path,
             shouldTransfer = true;
             exists = false;
         } else {
+            assert(false);
             spdlog::error("Failed to statx dest {}: {}\n", remote,
                           strerror(errno));
             return 1;
@@ -742,18 +924,29 @@ reroll:
         pthread_rwlock_rdlock(&sharedState->hlinkState.lock);
         auto srcHLIt = sharedState->hlinkState.srcToDst.find(stx.stx_ino);
         if (srcHLIt != sharedState->hlinkState.srcToDst.end()) {
+
             shouldTransfer = false;
             bool wrongInode = destStx.stx_ino != srcHLIt->second->destInode;
             if (!exists || wrongInode) {
+                thread_local size_t linkRootBufSize = 4096;
+                thread_local AllocRef linkRootBuf =
+                    AllocatorAllocate(sharedState->alloc, linkRootBufSize);
+
+                int ok = (!stringrefMemcpyWithRealloc(
+                    sharedState->alloc, srcHLIt->second->remote, &linkRootBuf,
+                    &linkRootBufSize));
+                assert(ok);
+                const char *linkRoot =
+                    (const char *)allocDeref(sharedState->alloc, linkRootBuf);
+
                 if (wrongInode) {
                     spdlog::debug("{} has incorrect inode on destination. "
                                   "Relinking to root {}",
-                                  remote, srcHLIt->second->remote.c_str());
+                                  remote, linkRoot);
                 }
 
                 if (srcHLIt->second->transferred) {
                     isPendingHardlink = true;
-                    const char *linkRoot = srcHLIt->second->remote.c_str();
                     spdlog::debug("root {} has already been transferred. "
                                   "Hardlinking to {}",
                                   linkRoot, remote);
@@ -770,9 +963,17 @@ reroll:
                 } else {
                     spdlog::debug("{} has not been transferred. Queueing "
                                   "hardlinkage to {}",
-                                  srcHLIt->second->remote.c_str(), remote);
+                                  linkRoot, remote);
                     srcHLIt->second->lock.lock();
-                    srcHLIt->second->links.push_back(std::string(remote));
+                    LinkEntryRef entryRef = AllocatorAllocate(
+                        sharedState->alloc, sizeof(LinkEntry));
+
+                    ((StringPart *)allocDeref(sharedState->alloc, path))->rc++;
+                    ((LinkEntry *)allocDeref(sharedState->alloc, entryRef))
+                        ->link = path;
+
+                    srcHLIt->second->links = linkEntryAppend(
+                        sharedState->alloc, srcHLIt->second->links, entryRef);
                     isPendingHardlink = true;
                     srcHLIt->second->lock.unlock();
                 }
@@ -790,7 +991,8 @@ reroll:
 
                 HLinkInfo *phinfo = new HLinkInfo;
                 sharedState->hlinkState.srcToDst[stx.stx_ino] = phinfo;
-                phinfo->remote = std::string(remote);
+                phinfo->links = {};
+                phinfo->remote = STRING_PART_RC_INC(sharedState->alloc, path);
                 phinfo->destInode = destStx.stx_ino;
                 phinfo->transferred = false;
 
@@ -825,7 +1027,7 @@ reroll:
     }
 
     if (shouldTransfer) {
-        unlinkat(destRootFD, partial.c_str(), 0);
+        unlinkat(destRootFD, partial, 0);
 
         if (S_ISREG(stx.stx_mode)) {
 
@@ -840,7 +1042,7 @@ reroll:
             }
 
             int dstFd =
-                openat(destRootFD, partial.c_str(),
+                openat(destRootFD, partial,
                        O_RDWR | O_CREAT | O_DIRECT | O_NOATIME, stx.stx_mode);
 
             if (dstFd < 0) {
@@ -856,7 +1058,7 @@ reroll:
     close(srcFd);                                                              \
     close(dstFd)
 
-            if (fchownat(destRootFD, partial.c_str(), stx.stx_uid, stx.stx_gid,
+            if (fchownat(destRootFD, partial, stx.stx_uid, stx.stx_gid,
                          AT_SYMLINK_NOFOLLOW) < 0) {
                 spdlog::error("failed to fchownat {}: {}", remote,
                               strerror(errno));
@@ -875,8 +1077,8 @@ reroll:
 
             sharedState->jobQueue.enqueue({
                 .firstLook = isFirstLook,
-                .remote = strdup(remote),
-                .partial = strdup(partial.c_str()),
+                .remote = STRING_PART_RC_INC(sharedState->alloc, path),
+                .partial = STRING_PART_RC_INC(sharedState->alloc, partialRef),
                 .stx = stx,
                 .srcFd = srcFd,
                 .dstFd = dstFd,
@@ -887,15 +1089,15 @@ reroll:
         } else if (S_ISLNK(stx.stx_mode)) {
 
             // symlinkat(, int tofd, const char *to)
-            char *contents = readSymlink(path.c_str());
+            char *contents = readSymlink(sharedState->alloc, srcRootFD, remote);
 
             if (!contents) {
-                spdlog::error("failed to read symlink {}", path);
+                spdlog::error("failed to read symlink {}", remote);
                 return 1;
             }
 
             spdlog::trace("performing symlink {}->{}", remote, contents);
-            if (symlinkat(contents, destRootFD, partial.c_str()) < 0) {
+            if (symlinkat(contents, destRootFD, partial) < 0) {
                 spdlog::error("failed to symlinkat {}: {}", remote,
                               strerror(errno));
                 free(contents);
@@ -907,8 +1109,9 @@ reroll:
             if (!isPendingHardlink) {
                 sharedState->finishQueue.enqueue({
                     .firstLook = isFirstLook,
-                    .remote = strdup(remote),
-                    .partial = strdup(partial.c_str()),
+                    .remote = STRING_PART_RC_INC(sharedState->alloc, path),
+                    .partial =
+                        STRING_PART_RC_INC(sharedState->alloc, partialRef),
                     .stx = stx,
                     .srcFd = -1,
                     .dstFd = -1,
@@ -919,8 +1122,8 @@ reroll:
         if (!isPendingHardlink) {
             sharedState->finishQueue.enqueue({
                 .firstLook = isFirstLook,
-                .remote = strdup(remote),
-                .partial = NULL,
+                .remote = STRING_PART_RC_INC(sharedState->alloc, path),
+                .partial = {},
                 .stx = stx,
                 .srcFd = -1,
                 .dstFd = -1,
@@ -931,20 +1134,36 @@ reroll:
     return 0;
 }
 
-int processDir(const std::string &path, std::optional<dev_t> dev,
-               size_t srcRootLen, int srcRootFD, int destRootFD,
-               SharedState *sharedState) {
-    int fd = open(path.c_str(), O_RDONLY | O_DIRECTORY);
-    auto sharedFD = std::make_shared<FileDescriptor>();
-    sharedFD->fd = fd;
+int processDir(StringPartRef path, std::optional<dev_t> dev, size_t srcRootLen,
+               int srcRootFD, int destRootFD, SharedState *sharedState) {
+    assert(!isNullRef(path));
+
+    thread_local size_t remoteBufSize = PATH_MAX;
+    thread_local AllocRef remoteBuf =
+        AllocatorAllocate(sharedState->alloc, remoteBufSize);
+    int ok = (!stringrefMemcpyWithRealloc(sharedState->alloc, path, &remoteBuf,
+                                          &remoteBufSize));
+    assert(ok);
+
+    const char *remote =
+        (const char *)allocDeref(sharedState->alloc, remoteBuf);
+
+    int fd = openat(srcRootFD, remote, O_RDONLY | O_DIRECTORY);
+    if (fd < 0) {
+        assert(false);
+        spdlog::error("failed to open directory {}: {}({})", remote, errno,
+                      strerror(errno));
+        return -1;
+    }
 
     struct statx stx;
-    int ret = statx(AT_FDCWD, path.c_str(), AT_SYMLINK_NOFOLLOW,
-                    STATX_BASIC_STATS, &stx);
+    int ret =
+        statx(srcRootFD, remote, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &stx);
 
     if (ret < 0) {
-        fprintf(stderr, "ERROR: failed to stat %s: %d (%s)\n", path.c_str(),
-                errno, strerror(errno));
+        assert(false);
+        fprintf(stderr, "ERROR: failed to stat %s: %d (%s)\n", remote, errno,
+                strerror(errno));
         return -1;
     }
 
@@ -957,10 +1176,10 @@ int processDir(const std::string &path, std::optional<dev_t> dev,
         return 0;
     }
 
-    const char *remote = path.c_str() + srcRootLen;
-    if (remote[0] == '/') {
-        remote++;
-    }
+    // const char *remote = path.c_str() + srcRootLen;
+    // if (remote[0] == '/') {
+    //     remote++;
+    // }
 
     if (remote[0] && mkdirat(destRootFD, remote, stx.stx_mode) < 0 &&
         errno != EEXIST) {
@@ -970,18 +1189,18 @@ int processDir(const std::string &path, std::optional<dev_t> dev,
     }
 
     sharedState->finishQueue.enqueue({
-        .remote = strdup(remote),
-        .partial = NULL,
+        .remote = STRING_PART_RC_INC(sharedState->alloc, path),
+        .partial = {},
         .stx = stx,
         .srcFd = -1,
         .dstFd = -1,
     });
 
     sem_wait(&sharedState->fdSem);
-    DIR *dir = opendir(path.c_str());
+    DIR *dir = fdopendir(fd);
     if (!dir) {
-        fprintf(stderr, "ERROR: failed to open directory %s: %d (%s)\n",
-                path.c_str(), errno, strerror(errno));
+        fprintf(stderr, "ERROR: failed to open directory %s: %d (%s)\n", remote,
+                errno, strerror(errno));
         sem_post(&sharedState->fdSem);
         return -1;
     }
@@ -993,19 +1212,32 @@ int processDir(const std::string &path, std::optional<dev_t> dev,
         }
 
         // fprintf(stderr, "name: %s\n", d->d_name);
+        // std::string newPath =
+        //     path + std::string("/") + std::string((const char *)d->d_name);
+        //
+        StringPartRef newPathRef = toStringPart(
+            sharedState->alloc, path, "/", 1, d->d_name, strlen(d->d_name));
 
-        std::string newPath =
-            path + std::string("/") + std::string((const char *)d->d_name);
+        // spdlog::info(
+        //     "attempting to create {}/{}, result is {}",
+        //     stringrefImmediateToCString(sharedState->alloc, path), d->d_name,
+        //     stringrefImmediateToCString(sharedState->alloc, newPathRef));
         if (d->d_type == DT_DIR) {
 #pragma omp task
-            processDir(newPath, dev, srcRootLen, srcRootFD, destRootFD,
+            processDir(newPathRef, dev, srcRootLen, srcRootFD, destRootFD,
                        sharedState);
         } else {
+            // spdlog::info(
+            //     "processDir({}) --> processNonDir({})", remote,
+            //     stringrefImmediateToCString(sharedState->alloc, newPathRef));
+
 #pragma omp task
-            processNonDir(newPath, sharedFD, dev, srcRootLen, srcRootFD,
-                          destRootFD, sharedState);
+            processNonDir(newPathRef, dev, srcRootLen, srcRootFD, destRootFD,
+                          sharedState);
         }
     }
+
+    // spdlog::info("dir {} finished", remote);
     // #pragma taskwait
     // close(fd);
 
@@ -1038,9 +1270,37 @@ void finishProcessor(SharedState *sharedState) {
                 sem_post(&sharedState->fdSem);
             }
 
+            assert(!isNullRef(fileJob.remote));
+
+            StringPartGuard remotePartGuard{sharedState->alloc, fileJob.remote};
+            thread_local size_t remoteBufSize = PATH_MAX;
+            thread_local AllocRef remoteBuf =
+                AllocatorAllocate(sharedState->alloc, remoteBufSize);
+            int ok =
+                (!stringrefMemcpyWithRealloc(sharedState->alloc, fileJob.remote,
+                                             &remoteBuf, &remoteBufSize));
+            assert(ok);
+            const char *remote =
+                (const char *)allocDeref(sharedState->alloc, remoteBuf);
+
+            StringPartGuard partialPartGuard{sharedState->alloc,
+                                             fileJob.partial};
+            thread_local size_t partialBufSize = PATH_MAX;
+            thread_local AllocRef partialBuf =
+                AllocatorAllocate(sharedState->alloc, partialBufSize);
+            if (!isNullRef(fileJob.partial)) {
+                ok = (!stringrefMemcpyWithRealloc(sharedState->alloc,
+                                                  fileJob.partial, &partialBuf,
+                                                  &partialBufSize));
+                assert(ok);
+            }
+
+            const char *partial =
+                (const char *)allocDeref(sharedState->alloc, partialBuf);
+
             struct statx destStx = {};
             if (statx(sharedState->destRootFD,
-                      fileJob.partial ? fileJob.partial : fileJob.remote,
+                      !isNullRef(fileJob.partial) ? partial : remote,
                       AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH, STATX_BASIC_STATS,
                       &destStx) < 0) {
                 spdlog::error("{} failed to stat destination: {} ", fileJob,
@@ -1053,11 +1313,10 @@ void finishProcessor(SharedState *sharedState) {
                 spdlog::error("{} failed with {} errors", fileJob,
                               fileJob.nErrors);
             } else {
-                if (fileJob.partial &&
+                if (!isNullRef(fileJob.partial) &&
                     (spdlog::trace("{} finish queue unlinking {}", fileJob,
-                                   fileJob.remote),
-                     unlinkat(sharedState->destRootFD, fileJob.remote, 0)) <
-                        0 &&
+                                   remote),
+                     unlinkat(sharedState->destRootFD, remote, 0)) < 0 &&
                     errno != ENOENT) {
                     spdlog::warn("{} failed to delete existing remote {} ",
                                  fileJob, strerror(errno));
@@ -1071,35 +1330,32 @@ void finishProcessor(SharedState *sharedState) {
 
                 bool fileJobSuccess = true;
 
-                if (fileJob.partial &&
+                if (!isNullRef(fileJob.partial) &&
                     (spdlog::trace("{} finish queue linking "
                                    "partial to remote {} -> {}",
-                                   fileJob, fileJob.partial, fileJob.remote),
-                     renameat(sharedState->destRootFD, fileJob.partial,
-                              sharedState->destRootFD, fileJob.remote) < 0)) {
+                                   fileJob, partial, remote),
+                     renameat(sharedState->destRootFD, partial,
+                              sharedState->destRootFD, remote) < 0)) {
                     spdlog::error("{} failed to perform partial to "
                                   "remote link {} -> {}: {} ",
-                                  fileJob, fileJob.partial, fileJob.remote,
-                                  strerror(errno));
+                                  fileJob, partial, remote, strerror(errno));
                     fileJobSuccess = false;
                 } else if ((destStx.stx_mtime.tv_sec !=
                             fileJob.stx.stx_mtime.tv_sec) &&
-                           utimensat(sharedState->destRootFD, fileJob.remote,
-                                     times,
+                           utimensat(sharedState->destRootFD, remote, times,
                                      AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) < 0) {
                     spdlog::error("{} failed to set modification times : {} ",
                                   fileJob, strerror(errno));
                     fileJobSuccess = false;
                 } else if ((destStx.stx_mode != fileJob.stx.stx_mode) &&
-                           fchmodat_shim(sharedState->destRootFD,
-                                         fileJob.remote,
+                           fchmodat_shim(sharedState->destRootFD, remote,
                                          fileJob.stx.stx_mode) < 0) {
                     spdlog::error("{} failed to set mode: {} ", fileJob,
                                   strerror(errno));
                     fileJobSuccess = false;
                 } else if ((destStx.stx_uid != fileJob.stx.stx_uid ||
                             destStx.stx_gid != fileJob.stx.stx_gid) &&
-                           fchownat(sharedState->destRootFD, fileJob.remote,
+                           fchownat(sharedState->destRootFD, remote,
                                     fileJob.stx.stx_gid, fileJob.stx.stx_uid,
                                     AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) < 0) {
                     spdlog::error("{} failed to chown: {} ", fileJob,
@@ -1133,30 +1389,53 @@ void finishProcessor(SharedState *sharedState) {
 
                     if (notend) {
                         phlstate->lock.lock();
-                        for (auto &tgt : phlstate->links) {
+                        LinkEntryRef curRef = phlstate->links;
+                        while (!isNullRef(curRef)) {
+                            LinkEntry *entry = (LinkEntry *)allocDeref(
+                                sharedState->alloc, curRef);
+
+                            thread_local size_t linkRootBufSize = 4096;
+                            thread_local AllocRef linkRootBuf =
+                                AllocatorAllocate(sharedState->alloc,
+                                                  linkRootBufSize);
+
+                            int ok = (!stringrefMemcpyWithRealloc(
+                                sharedState->alloc, entry->link, &linkRootBuf,
+                                &linkRootBufSize));
+                            assert(ok);
+
+                            const char *linkRoot = (const char *)allocDeref(
+                                sharedState->alloc, linkRootBuf);
+
                             spdlog::trace("{} finish queue performing "
                                           "pending link {} -> {}",
-                                          fileJob, fileJob.remote, tgt.c_str());
+                                          fileJob, remote, linkRoot);
 
-                            if (unlinkat(sharedState->destRootFD, tgt.c_str(),
-                                         0) < 0 &&
+                            if (unlinkat(sharedState->destRootFD, linkRoot, 0) <
+                                    0 &&
                                 errno != ENOENT) {
                                 spdlog::error("{} failed to unlink "
                                               "{} to apply "
                                               "pending: {}",
-                                              fileJob, tgt.c_str(),
+                                              fileJob, linkRoot,
                                               strerror(errno));
                             }
 
-                            if (linkat(sharedState->destRootFD, fileJob.remote,
-                                       sharedState->destRootFD, tgt.c_str(),
+                            if (linkat(sharedState->destRootFD, remote,
+                                       sharedState->destRootFD, linkRoot,
                                        0) < 0) {
                                 spdlog::error("{} failed to perform pending"
                                               " link {} -> {} : {}",
-                                              fileJob, fileJob.remote,
-                                              tgt.c_str(), strerror(errno));
+                                              fileJob, remote, linkRoot,
+                                              strerror(errno));
                             }
                             sharedState->nFinished++;
+
+                            LinkEntryRef prevRef = entry->prev;
+                            stringPartRelease(sharedState->alloc, entry->link);
+                            AllocatorFree(sharedState->alloc, curRef);
+
+                            curRef = prevRef;
                         }
                         phlstate->lock.unlock();
                     }
@@ -1175,13 +1454,13 @@ void finishProcessor(SharedState *sharedState) {
 
             sharedState->nFinished++;
 
-            if (fileJob.remote) {
-                free((void *)fileJob.remote);
-            }
-
-            if (fileJob.partial) {
-                free((void *)fileJob.partial);
-            }
+            // if (fileJob.remote) {
+            //     free((void *)fileJob.remote);
+            // }
+            //
+            // if (fileJob.partial) {
+            //     free((void *)fileJob.partial);
+            // }
         }
 
         if (done)
@@ -1214,8 +1493,10 @@ void incrementalLogger(SharedState *sharedState) {
                 bytesize::bytesize{
                     sharedState->totalBytesActuallyTransferred.load()},
                 bytesize::bytesize{sharedState->totalBytesSeen.load()},
-                bytesize::bytesize{(size_t)((double)sharedState->bytesRead.load() / delta)},
-                bytesize::bytesize{(size_t)((double)sharedState->bytesWritten.load() / delta)});
+                bytesize::bytesize{
+                    (size_t)((double)sharedState->bytesRead.load() / delta)},
+                bytesize::bytesize{(
+                    size_t)((double)sharedState->bytesWritten.load() / delta)});
 
             spdlog::info("\tallocation failures {}/{}",
                          sharedState->allocationFailures.load(),
@@ -1275,7 +1556,7 @@ int main(int argc, char *argv[]) {
     file_sink->set_level(spdlog::level::trace);
 
     auto logger = std::make_shared<spdlog::logger>(
-        spdlog::logger("copy2", {err_logger/*, file_sink*/}));
+        spdlog::logger("copy2", {err_logger, file_sink}));
     logger->set_level(spdlog::level::trace);
     spdlog::set_default_logger(logger);
 
@@ -1307,11 +1588,11 @@ int main(int argc, char *argv[]) {
     sem_init(&sharedState->fdSem, 0, MAX_FILES);
 
     size_t arena_size = 80UL * (1UL << 30);
-    void *buddy_metadata = malloc(buddy_sizeof(arena_size));
+    void *buddy_metadata = malloc(buddy_sizeof_alignment(arena_size, 4096));
     void *buddy_arena;
     posix_memalign(&buddy_arena, 4096, arena_size);
     // malloc(arena_size);
-    sharedState->allocator =
+    sharedState->copybufferAllocator =
         buddy_init_alignment((unsigned char *)buddy_metadata,
                              (unsigned char *)buddy_arena, arena_size, 4096);
 
@@ -1334,14 +1615,21 @@ int main(int argc, char *argv[]) {
     sharedState->destRootFD = destRootFD;
     sharedState->srcRootFD = srcRootFD;
 
+    sharedState->alloc = createAllocator(1024, 1ULL << 40, "copy2.mem");
+    globalAllocator = sharedState->alloc;
+
+    StringPartRef rootRef =
+        toStringPart(sharedState->alloc, {}, ".", 1, nullptr, 0);
+
     int ret = 0;
 #pragma omp parallel sections
     {
 #pragma omp section
         {
 #pragma omp taskgroup
-            ret = processDir(root, std::nullopt, strlen(root), srcRootFD,
-                             destRootFD, sharedState);
+            ret = processDir(STRING_PART_RC_INC(sharedState->alloc, rootRef),
+                             std::nullopt, strlen(root), srcRootFD, destRootFD,
+                             sharedState);
             sharedState->crawlDone = 1;
         }
 
