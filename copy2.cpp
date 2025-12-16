@@ -1104,8 +1104,6 @@ reroll:
                 return 1;
             }
 
-            free(contents);
-
             if (!isPendingHardlink) {
                 sharedState->finishQueue.enqueue({
                     .firstLook = isFirstLook,
@@ -1148,6 +1146,7 @@ int processDir(StringPartRef path, std::optional<dev_t> dev, size_t srcRootLen,
     const char *remote =
         (const char *)allocDeref(sharedState->alloc, remoteBuf);
 
+    sem_wait(&sharedState->fdSem);
     int fd = openat(srcRootFD, remote, O_RDONLY | O_DIRECTORY);
     if (fd < 0) {
         assert(false);
@@ -1188,15 +1187,6 @@ int processDir(StringPartRef path, std::optional<dev_t> dev, size_t srcRootLen,
         return -1;
     }
 
-    sharedState->finishQueue.enqueue({
-        .remote = STRING_PART_RC_INC(sharedState->alloc, path),
-        .partial = {},
-        .stx = stx,
-        .srcFd = -1,
-        .dstFd = -1,
-    });
-
-    sem_wait(&sharedState->fdSem);
     DIR *dir = fdopendir(fd);
     if (!dir) {
         fprintf(stderr, "ERROR: failed to open directory %s: %d (%s)\n", remote,
@@ -1237,12 +1227,17 @@ int processDir(StringPartRef path, std::optional<dev_t> dev, size_t srcRootLen,
         }
     }
 
-    // spdlog::info("dir {} finished", remote);
-    // #pragma taskwait
-    // close(fd);
-
     closedir(dir);
     sem_post(&sharedState->fdSem);
+
+    sharedState->finishQueue.enqueue({
+        .firstLook = true,
+        .remote = STRING_PART_RC_INC(sharedState->alloc, path),
+        .partial = {},
+        .stx = stx,
+        .srcFd = -1,
+        .dstFd = -1,
+    });
 
     return 0;
 }
@@ -1356,7 +1351,7 @@ void finishProcessor(SharedState *sharedState) {
                 } else if ((destStx.stx_uid != fileJob.stx.stx_uid ||
                             destStx.stx_gid != fileJob.stx.stx_gid) &&
                            fchownat(sharedState->destRootFD, remote,
-                                    fileJob.stx.stx_gid, fileJob.stx.stx_uid,
+                                    fileJob.stx.stx_uid, fileJob.stx.stx_gid,
                                     AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) < 0) {
                     spdlog::error("{} failed to chown: {} ", fileJob,
                                   strerror(errno));
