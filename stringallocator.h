@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 
 #define ALLOC_MAX_ARENA_SIZE UINT32_MAX
 #define ALLOC_ARENA_SIZE ALLOC_MAX_ARENA_SIZE
@@ -113,6 +114,8 @@ inline AllocatorArena __AllocatorCreateDiskArena(Allocator *alloc) {
     void *arenaMetadata =
         malloc(buddy_sizeof_alignment(ALLOC_ARENA_SIZE, alignment));
 
+    spdlog::info("arenaData {}, arenaMetadata {}", arenaData, arenaMetadata);
+
     return {
         .type = ARENA_DISK,
         ._metadata = arenaMetadata,
@@ -134,12 +137,12 @@ inline Allocator *createAllocator(size_t maxMemArenas, size_t diskSize,
                                   const char *diskfilename) {
     Allocator *alloc = (Allocator *)calloc(1, sizeof(Allocator));
 
-    alloc->nArenas = 1;
-    alloc->nMemArenas = 1;
-    alloc->arenas = (AllocatorArena *)realloc(
-        alloc->arenas, sizeof(AllocatorArena) * alloc->nArenas);
-
-    alloc->arenas[0] = __AllocatorCreateMemoryArena();
+    // alloc->nArenas = 1;
+    // alloc->nMemArenas = 1;
+    // alloc->arenas = (AllocatorArena *)realloc(
+    //     alloc->arenas, sizeof(AllocatorArena) * alloc->nArenas);
+    //
+    // alloc->arenas[0] = __AllocatorCreateMemoryArena();
 
     int fd = open(diskfilename, O_RDWR | O_CREAT);
     if (fd < 0) {
@@ -162,11 +165,17 @@ inline Allocator *createAllocator(size_t maxMemArenas, size_t diskSize,
     alloc->diskState.offset = 0;
     alloc->diskState.maxSize = diskSize;
 
+    struct rlimit rlim = {};
+    getrlimit(RLIMIT_DATA, &rlim);
+
+    spdlog::info("diskSize: {}", diskSize);
+    spdlog::info("RLIMIT_DATA: {}, {}", rlim.rlim_cur, rlim.rlim_max);
+
     alloc->diskState.data =
-        mmap(NULL, diskSize, PROT_READ | PROT_WRITE, 0, fd, 0);
-    if (!alloc->diskState.data) {
-        spdlog::error("Failed to mmap allocator disk backing file: {}",
-                      strerror(errno));
+        mmap(NULL, diskSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (alloc->diskState.data == (void *)-1) {
+        spdlog::error("Failed to mmap allocator disk backing file: {}({})",
+                      errno, strerror(errno));
         exit(1);
     }
 
@@ -198,11 +207,15 @@ inline AllocRef AllocatorAllocate(Allocator *alloc, size_t len) {
     arena = alloc->nArenas++;
     alloc->arenas = (AllocatorArena *)realloc(
         alloc->arenas, sizeof(AllocatorArena) * alloc->nArenas);
-    if (alloc->nMemArenas < alloc->maxMemArenas)
+    if (alloc->nMemArenas < alloc->maxMemArenas) {
         alloc->arenas[alloc->nArenas - 1] = __AllocatorCreateMemoryArena();
-    else
+    } else {
+        spdlog::info("creating disk allocator...");
         alloc->arenas[alloc->nArenas - 1] = __AllocatorCreateDiskArena(alloc);
+    }
 
+    spdlog::info("arena is {}",
+                 (void *)alloc->arenas[alloc->nArenas - 1].arena);
     allocated = buddy_calloc(alloc->arenas[alloc->nArenas - 1].arena, 1, len);
 
 alloc_success:
@@ -227,9 +240,9 @@ inline void *allocDeref(const Allocator *alloc, AllocRef ref) {
     return (uint8_t *)alloc->arenas[ref.arenaID]._data + ref.offset;
 }
 
-inline void AllocatorFree(Allocator* alloc, AllocRef ref) {
+inline void AllocatorFree(Allocator *alloc, AllocRef ref) {
     alloc->lock.lock();
-    void* ptr = allocDeref(alloc, ref);
+    void *ptr = allocDeref(alloc, ref);
 
     assert(ref.arenaID < alloc->nArenas);
 
