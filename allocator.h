@@ -2,6 +2,7 @@
 
 #include "buddy_alloc.h"
 #include "spdlog/spdlog.h"
+#include "spinlock.h"
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
@@ -11,35 +12,6 @@
 
 #define ALLOC_MAX_ARENA_SIZE UINT32_MAX
 #define ALLOC_ARENA_SIZE ALLOC_MAX_ARENA_SIZE
-
-// https://rigtorp.se/spinlock
-struct spinlock {
-    std::atomic<bool> lock_ = {0};
-
-    void lock() noexcept {
-        for (;;) {
-            // Optimistically assume the lock is free on the first try
-            if (!lock_.exchange(true, std::memory_order_acquire)) {
-                return;
-            }
-            // Wait for lock to be released without generating cache misses
-            while (lock_.load(std::memory_order_relaxed)) {
-                // Issue X86 PAUSE or ARM YIELD instruction to reduce contention
-                // between hyper-threads
-                __builtin_ia32_pause();
-            }
-        }
-    }
-
-    bool try_lock() noexcept {
-        // First do a relaxed load to check if lock is free in order to prevent
-        // unnecessary cache misses if someone does while(!try_lock())
-        return !lock_.load(std::memory_order_relaxed) &&
-               !lock_.exchange(true, std::memory_order_acquire);
-    }
-
-    void unlock() noexcept { lock_.store(false, std::memory_order_release); }
-};
 
 static_assert(ALLOC_ARENA_SIZE <= ALLOC_MAX_ARENA_SIZE,
               "allocator arena size cannot exceed UINT32_MAX for "
@@ -81,176 +53,99 @@ struct Allocator {
     AllocatorArena *arenas;
 };
 
-inline AllocatorArena __AllocatorCreateMemoryArena() {
-    const size_t alignment =
-        128; // I assume here that for non-trivial projects the path length is
-             // going to be more than 64B in 90% of cases
-    void *arenaData = malloc(ALLOC_ARENA_SIZE);
-    void *arenaMetadata =
-        malloc(buddy_sizeof_alignment(ALLOC_ARENA_SIZE, alignment));
-
-    return {
-        .type = ARENA_MEMORY,
-        ._metadata = arenaMetadata,
-        ._data = arenaData,
-        .arena = buddy_init_alignment((unsigned char *)arenaMetadata,
-                                      (unsigned char *)arenaData,
-                                      ALLOC_ARENA_SIZE, alignment),
-    };
-}
-
-inline AllocatorArena __AllocatorCreateDiskArena(Allocator *alloc) {
-    const size_t alignment =
-        128; // I assume here that for non-trivial projects the path length is
-             // going to be more than 64B in 90% of cases
-    if (alloc->diskState.offset + ALLOC_ARENA_SIZE > alloc->diskState.maxSize) {
-        spdlog::error("Allocator is out of disk space!");
-        exit(1);
-    }
-
-    void *arenaData =
-        (uint8_t *)alloc->diskState.data + alloc->diskState.offset;
-    alloc->diskState.offset += ALLOC_ARENA_SIZE;
-    void *arenaMetadata =
-        malloc(buddy_sizeof_alignment(ALLOC_ARENA_SIZE, alignment));
-
-    spdlog::info("arenaData {}, arenaMetadata {}", arenaData, arenaMetadata);
-
-    return {
-        .type = ARENA_DISK,
-        ._metadata = arenaMetadata,
-        ._data = arenaData,
-        .arena = buddy_init_alignment((unsigned char *)arenaMetadata,
-                                      (unsigned char *)arenaData,
-                                      ALLOC_ARENA_SIZE, alignment),
-    };
-}
-
-// inline void __AllocatorDestroyMemoryArena(AllocatorArena *arena) {
-//     free(arena->arena);
-//     free(arena->_metadata);
-//     free(arena->_data);
-//     *arena = {};
-// }
-
-inline Allocator *createAllocator(size_t maxMemArenas, size_t diskSize,
-                                  const char *diskfilename) {
-    Allocator *alloc = (Allocator *)calloc(1, sizeof(Allocator));
-
-    // alloc->nArenas = 1;
-    // alloc->nMemArenas = 1;
-    // alloc->arenas = (AllocatorArena *)realloc(
-    //     alloc->arenas, sizeof(AllocatorArena) * alloc->nArenas);
-    //
-    // alloc->arenas[0] = __AllocatorCreateMemoryArena();
-
-    int fd = open(diskfilename, O_RDWR | O_CREAT);
-    if (fd < 0) {
-        spdlog::error("Failed to open allocator disk backing file {}: {}",
-                      diskfilename, strerror(errno));
-        exit(1);
-    }
-
-    if (ftruncate(fd, diskSize) < 0) {
-        spdlog::error(
-            "Failed to ftruncate allocator disk backing file {} to size {}: {}",
-            diskfilename, diskSize, strerror(errno));
-        exit(1);
-    }
-
-    alloc->maxMemArenas = maxMemArenas;
-
-    alloc->diskState = {};
-    alloc->diskState.fd = fd;
-    alloc->diskState.offset = 0;
-    alloc->diskState.maxSize = diskSize;
-
-    struct rlimit rlim = {};
-    getrlimit(RLIMIT_DATA, &rlim);
-
-    spdlog::info("diskSize: {}", diskSize);
-    spdlog::info("RLIMIT_DATA: {}, {}", rlim.rlim_cur, rlim.rlim_max);
-
-    alloc->diskState.data =
-        mmap(NULL, diskSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (alloc->diskState.data == (void *)-1) {
-        spdlog::error("Failed to mmap allocator disk backing file: {}({})",
-                      errno, strerror(errno));
-        exit(1);
-    }
-
-    return alloc;
-}
-
-// Allocate a string of len
-// Note that len includes the null terminator
-inline AllocRef AllocatorAllocate(Allocator *alloc, size_t len) {
-    assert(len);
-    assert(alloc);
-    assert(len <= UINT32_MAX);
-
-    alloc->lock.lock();
-
-    void *allocated = NULL;
-    uint32_t arena = 0;
-    // I assume that the number of arenas for this application will be
-    // relatively low so we can iterate through all of them to prioritize
-    // compactness
-    for (; arena < alloc->nArenas; arena++) {
-        allocated = buddy_calloc(alloc->arenas[arena].arena, 1, len);
-
-        if (allocated) {
-            goto alloc_success;
-        }
-    }
-
-    arena = alloc->nArenas++;
-    alloc->arenas = (AllocatorArena *)realloc(
-        alloc->arenas, sizeof(AllocatorArena) * alloc->nArenas);
-    if (alloc->nMemArenas < alloc->maxMemArenas) {
-        alloc->arenas[alloc->nArenas - 1] = __AllocatorCreateMemoryArena();
-    } else {
-        spdlog::info("creating disk allocator...");
-        alloc->arenas[alloc->nArenas - 1] = __AllocatorCreateDiskArena(alloc);
-    }
-
-    spdlog::info("arena is {}",
-                 (void *)alloc->arenas[alloc->nArenas - 1].arena);
-    allocated = buddy_calloc(alloc->arenas[alloc->nArenas - 1].arena, 1, len);
-
-alloc_success:
-    assert(allocated);
-    int64_t offset =
-        (uint8_t *)allocated - (uint8_t *)alloc->arenas[arena]._data;
-    assert(offset >= 0);
-    assert(offset <= UINT32_MAX);
-
-    alloc->lock.unlock();
-
-    return {
-        .arenaID = arena,
-        .offset = (uint32_t)offset,
-    };
-}
-
 inline void *allocDeref(const Allocator *alloc, AllocRef ref) {
-    assert(ref.arenaID < alloc->nArenas);
+    return *(void **)&ref;
+
+    assert(ref.arenaID <= alloc->nArenas);
+    assert(ref.arenaID != 0);
     assert(ref.offset <= ALLOC_MAX_ARENA_SIZE);
 
-    return (uint8_t *)alloc->arenas[ref.arenaID]._data + ref.offset;
-}
-
-inline void AllocatorFree(Allocator *alloc, AllocRef ref) {
-    alloc->lock.lock();
-    void *ptr = allocDeref(alloc, ref);
-
-    assert(ref.arenaID < alloc->nArenas);
-
-    buddy_free(alloc->arenas[ref.arenaID].arena, ptr);
-    alloc->lock.unlock();
+    return (uint8_t *)alloc->arenas[ref.arenaID - 1]._data + ref.offset;
 }
 
 inline bool isNullRef(AllocRef ref) {
     AllocRef zeroRef = {};
     return !memcmp(&zeroRef, &ref, sizeof(AllocRef));
 }
+
+Allocator *createAllocator(size_t maxMemArenas, size_t diskSize,
+                           const char *diskfilename);
+AllocRef AllocatorAllocate(Allocator *alloc, size_t len);
+void AllocatorFree(Allocator *alloc, AllocRef ref);
+
+// const size_t STRING_PART_MAX_LEN = 64 - sizeof(AllocRef) - 1;
+typedef AllocRef StringPartRef;
+struct StringPart {
+    std::atomic_size_t rc;
+    size_t len;
+    StringPartRef prev;
+    char data[];
+};
+
+#define STRING_PART_RC_INC(alloc, ref)                                         \
+    (((StringPart *)allocDeref(alloc, ref))->rc++, ref)
+
+const char *stringrefImmediateToCString(Allocator *alloc, StringPartRef ref);
+inline void stringPartRelease(Allocator *alloc, StringPartRef s) {
+    StringPart *part;
+    StringPartRef curRef = s;
+    size_t i = 0;
+    while (!isNullRef(s) && (part = (StringPart *)allocDeref(alloc, curRef))) {
+        i++;
+        size_t rc = part->rc--;
+        if (!rc) {
+            spdlog::error("rc is zero: {}, it {}",
+                          stringrefImmediateToCString(alloc, s), i);
+        }
+        assert(rc);
+
+        AllocRef sTemp = curRef;
+        curRef = part->prev;
+        if (rc <= 1) {
+            AllocatorFree(alloc, sTemp);
+        } else {
+            break;
+        }
+    }
+}
+
+struct StringPartGuard {
+    Allocator *alloc;
+    StringPartRef ref;
+
+    ~StringPartGuard() {
+        if (!isNullRef(ref))
+            stringPartRelease(alloc, ref);
+    }
+};
+
+size_t stringRefMemcpy(const Allocator *alloc, StringPartRef ref, char *buf,
+                       size_t bufsize);
+
+int stringrefMemcpyWithRealloc(Allocator *alloc, StringPartRef ref,
+                               AllocRef *buf, size_t *bufsize);
+
+StringPartRef toStringPart(Allocator *alloc, StringPartRef currentTip,
+                           const char *s1, size_t len1, const char *s2,
+                           size_t len2);
+
+typedef AllocRef LinkEntryRef;
+struct LinkEntry {
+    StringPartRef link;
+    LinkEntryRef prev;
+};
+
+inline LinkEntryRef linkEntryAppend(Allocator *alloc, LinkEntryRef tip,
+                                    LinkEntryRef next) {
+    assert(!isNullRef(next));
+    if (isNullRef(tip)) {
+        ((LinkEntry *)allocDeref(alloc, next))->prev = {};
+        return next;
+    }
+
+    ((LinkEntry *)allocDeref(alloc, next))->prev = tip;
+
+    return next;
+}
+
+extern Allocator *globalAllocator;

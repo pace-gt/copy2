@@ -1,6 +1,9 @@
 #include "hlinkstate.h"
 #include "allocator.h"
+#include "filejob.h"
 #include "gtl/phmap.hpp"
+#include "logging.h"
+#include <mutex>
 #include <omp.h>
 #include <pthread.h>
 
@@ -119,6 +122,8 @@ static void deletePair(HLinkState *state, MDB_txn *txn, MDB_env *env,
 }
 
 MDB_txn *getRDOnlyTxn(HLinkState *state) {
+    state->rdTxnAquireLock.lock();
+
     auto it = state->rdTxns.find(omp_get_thread_num());
     if (it == state->rdTxns.end()) {
         int err = 0;
@@ -131,10 +136,16 @@ MDB_txn *getRDOnlyTxn(HLinkState *state) {
             exit(1);
         }
 
-        return state->rdTxns[omp_get_thread_num()];
+        auto val = state->rdTxns[omp_get_thread_num()];
+        state->rdTxnAquireLock.unlock();
+
+        return val;
     }
 
-    return it->second;
+    auto ret = it->second;
+    state->rdTxnAquireLock.unlock();
+
+    return ret;
 }
 
 void hlinkStateRegisterLinkRoot(HLinkState *state, Allocator *alloc,
@@ -142,7 +153,8 @@ void hlinkStateRegisterLinkRoot(HLinkState *state, Allocator *alloc,
                                 uint64_t srcInode, uint64_t destInode,
                                 bool destExists, size_t srcNLinksExpected,
                                 size_t destNLinksExpected, int destRootFD,
-                                bool *shouldTransfer) {
+                                bool *shouldTransfer, bool *isFirstLook,
+                                bool *isPendingHardlink) {
 
     bool origShouldTransfer = *shouldTransfer;
 reroll:
@@ -160,8 +172,8 @@ reroll:
         destExists && readPair(rdTxn, state->env, state->revTableCache,
                                state->revTable, destInode, &revinfoRef);
 
-    bool isPendingHardlink = false;
-    bool isFirstLook = false;
+    *isPendingHardlink = false;
+    *isFirstLook = false;
 
     bool haveWrlock = false;
 
@@ -190,7 +202,6 @@ reroll:
 
             hinfo->lock.lock();
             if (hinfo->transferred) {
-                isPendingHardlink = true;
                 spdlog::debug("root {} has already been transferred. "
                               "Hardlinking to {}",
                               linkRoot, remote);
@@ -204,16 +215,27 @@ reroll:
                     exit(1);
                 }
 
-                assert(hinfo->nlinkRC > 0);
-                hinfo->nlinkRC--;
+                hinfo->nlinkRC--; // this can underflow, however it's fine
+                                  // because once all readers release their
+                                  // locks, the thread who observes the refcount
+                                  // go to 0 deletes and frees
 
                 if (!hinfo->nlinkRC) {
+                    hinfo->lock.unlock();
                     pthread_rwlock_unlock(&state->lock);
                     pthread_rwlock_wrlock(&state->lock); // promote lock
                     haveWrlock = true;
-                    deletePair(state, state->wrTxn, state->env,
-                               state->forwardTable, state->forwardTableCache,
-                               hinfo->destInode);
+                    if (readPair(state->wrTxn, state->env,
+                                 state->forwardTableCache, state->forwardTable,
+                                 srcInode, &hinfoRef)) {
+                        hinfo->lock.lock();
+                        deletePair(state, state->wrTxn, state->env,
+                                   state->forwardTable,
+                                   state->forwardTableCache, srcInode);
+                        // AllocatorFree(alloc, hinfoRef);
+                    }
+                    hinfoRef = {};
+                    hinfo = NULL;
                 }
             } else {
                 spdlog::debug("{} has not been transferred. Queueing "
@@ -226,10 +248,14 @@ reroll:
                     STRING_PART_RC_INC(alloc, remoteRef);
 
                 hinfo->links = linkEntryAppend(alloc, hinfo->links, entryRef);
-                isPendingHardlink = true;
+
+                *isPendingHardlink = true;
             }
-            hinfo->lock.unlock();
-        } else {
+            *shouldTransfer = false;
+
+            if (!isNullRef(hinfoRef)) {
+                hinfo->lock.unlock();
+            }
         }
     } else {
         pthread_rwlock_unlock(&state->lock);
@@ -241,28 +267,26 @@ reroll:
         bool haveSrcState =
             readPair(rdTxn, state->env, state->forwardTableCache,
                      state->forwardTable, srcInode, &hinfoRef);
-        hinfo = (HLinkInfo *)allocDeref(alloc, hinfoRef);
 
         if (haveSrcState) {
             pthread_rwlock_unlock(&state->lock);
             goto reroll;
         }
 
-        isFirstLook = true;
+        *isFirstLook = true;
 
         hinfoRef = AllocatorAllocate(alloc, sizeof(HLinkInfo));
         hinfo = (HLinkInfo *)allocDeref(alloc, hinfoRef);
-
-        writePair(state, &state->wrTxn, state->env, state->forwardTable,
-                  state->forwardTableCache, state->maxTableCacheSize, srcInode,
-                  hinfoRef);
-
         hinfo->links = {};
         hinfo->remote = STRING_PART_RC_INC(alloc, remoteRef);
         hinfo->destInode = destInode;
         hinfo->transferred = false;
         hinfo->nlinkRC = srcNLinksExpected - 1;
-        assert(nlinksExpected > 1);
+        assert(srcNLinksExpected > 1);
+
+        writePair(state, &state->wrTxn, state->env, state->forwardTable,
+                  state->forwardTableCache, state->maxTableCacheSize, srcInode,
+                  hinfoRef);
 
         if (destExists && !origShouldTransfer) {
             if (haveDstState) {
@@ -303,21 +327,28 @@ reroll_dststate:
     } else if (destExists && haveDstState) {
         revinfo = (HLinkInfoRev *)allocDeref(alloc, revinfoRef);
         revinfo->lock.lock();
-        assert(revinfo->nlinkRC);
         revinfo->nlinkRC--;
 
         if (!revinfo->nlinkRC) {
             if (!haveWrlock) {
+                revinfo->lock.unlock();
                 pthread_rwlock_unlock(&state->lock);
                 pthread_rwlock_wrlock(&state->lock); // promote lock
+                revinfo->lock.lock();
                 haveWrlock = true;
             }
 
-            deletePair(state, state->wrTxn, state->env, state->revTable,
-                       state->revTableCache, destInode);
+            if (readPair(state->wrTxn, state->env, state->revTableCache,
+                         state->revTable, destInode, &revinfoRef)) {
+                deletePair(state, state->wrTxn, state->env, state->revTable,
+                           state->revTableCache, destInode);
+                AllocatorFree(alloc, revinfoRef);
+                revinfoRef = {};
+                revinfo = NULL;
+            }
+        } else {
+            revinfo->lock.unlock();
         }
-
-        revinfo->lock.unlock();
     }
 
     pthread_rwlock_unlock(&state->lock);
@@ -325,8 +356,6 @@ reroll_dststate:
 
 void createHLinkState(HLinkState *state, const char *path,
                       size_t maxTableCacheSize, size_t maxEnvSize) {
-    *state = {};
-
     static MDB_env *mdbEnv = NULL;
     int err = 0;
     if ((err = mdb_env_create(&mdbEnv))) {
@@ -336,7 +365,7 @@ void createHLinkState(HLinkState *state, const char *path,
     }
     mdb_env_set_maxdbs(mdbEnv, 2);
     mdb_env_set_mapsize(mdbEnv, maxEnvSize);
-    if ((err = mdb_env_open(mdbEnv, "hmaptest.db",
+    if ((err = mdb_env_open(mdbEnv, path,
                             MDB_NOTLS | MDB_NOLOCK | MDB_CREATE | MDB_NOSUBDIR,
                             0777))) {
         fprintf(stderr, "ERROR: failed to open mdb environment: error %s\n",
@@ -390,4 +419,87 @@ void createHLinkState(HLinkState *state, const char *path,
     state->maxTableCacheSize = maxTableCacheSize;
 
     pthread_rwlock_init(&state->lock, 0);
+}
+
+void hlinkStateHandleTransfer(const FileCopyJob &fileJob, HLinkState *state,
+                              Allocator *alloc, const char *remote,
+                              uint64_t srcInode, uint64_t destInode,
+                              int srcRootFD, int destRootFD,
+                              size_t *nFinishedInc) {
+    *nFinishedInc = 0;
+    pthread_rwlock_rdlock(&state->lock);
+    AllocRef hlinkinfoRef;
+    bool haveHLinkState =
+        readPair(getRDOnlyTxn(state), state->env, state->forwardTableCache,
+                 state->forwardTable, srcInode, &hlinkinfoRef);
+    HLinkInfo *hlinkinfo;
+
+    if (haveHLinkState) {
+        hlinkinfo = (HLinkInfo *)allocDeref(alloc, hlinkinfoRef);
+        hlinkinfo->lock.lock();
+        assert(!hlinkinfo->transferred);
+        hlinkinfo->transferred = true;
+        hlinkinfo->destInode = destInode;
+
+        LinkEntryRef curRef = hlinkinfo->links;
+        while (!isNullRef(curRef)) {
+            LinkEntry *entry = (LinkEntry *)allocDeref(alloc, curRef);
+
+            thread_local size_t linkRootBufSize = 4096;
+            thread_local AllocRef linkRootBuf =
+                AllocatorAllocate(alloc, linkRootBufSize);
+
+            int ok = (!stringrefMemcpyWithRealloc(
+                alloc, entry->link, &linkRootBuf, &linkRootBufSize));
+            assert(ok);
+
+            const char *linkRoot = (const char *)allocDeref(alloc, linkRootBuf);
+
+            spdlog::trace("{} finish queue performing "
+                          "pending link {} -> {}",
+                          fileJob, remote, linkRoot);
+
+            if (unlinkat(destRootFD, linkRoot, 0) < 0 && errno != ENOENT) {
+                spdlog::error("{} failed to unlink "
+                              "{} to apply "
+                              "pending: {}",
+                              fileJob, linkRoot, strerror(errno));
+            }
+
+            if (linkat(destRootFD, remote, destRootFD, linkRoot, 0) < 0) {
+                spdlog::error("{} failed to perform pending"
+                              " link {} -> {} : {}",
+                              fileJob, remote, linkRoot, strerror(errno));
+            }
+            (*nFinishedInc)++;
+
+            LinkEntryRef prevRef = entry->prev;
+            stringPartRelease(alloc, entry->link);
+            AllocatorFree(alloc, curRef);
+
+            curRef = prevRef;
+        }
+
+        hlinkinfo->nlinkRC--;
+        if (!hlinkinfo->nlinkRC) {
+            hlinkinfo->lock.unlock();
+            pthread_rwlock_unlock(&state->lock);
+            pthread_rwlock_wrlock(&state->lock); // promote lock
+            if (readPair(state->wrTxn, state->env, state->forwardTableCache,
+                         state->forwardTable, destInode, &hlinkinfoRef)) {
+                hlinkinfo->lock.lock();
+                deletePair(state, state->wrTxn, state->env, state->revTable,
+                           state->revTableCache, srcInode);
+                AllocatorFree(alloc, hlinkinfoRef);
+                hlinkinfoRef = {};
+                hlinkinfo = NULL;
+            }
+        }
+
+        if (!isNullRef(hlinkinfoRef)) {
+            hlinkinfo->lock.unlock();
+        }
+    }
+
+    pthread_rwlock_unlock(&state->lock);
 }

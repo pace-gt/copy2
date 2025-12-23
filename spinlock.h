@@ -1,15 +1,19 @@
 #pragma once
 
 #include <atomic>
+#include <omp.h>
 
 // https://rigtorp.se/spinlock
 struct spinlock {
     std::atomic<bool> lock_ = {0};
 
+    int me = -1;
+
     void lock() noexcept {
         for (;;) {
             // Optimistically assume the lock is free on the first try
             if (!lock_.exchange(true, std::memory_order_acquire)) {
+                me = omp_get_thread_num();
                 return;
             }
             // Wait for lock to be released without generating cache misses
@@ -28,5 +32,8 @@ struct spinlock {
                !lock_.exchange(true, std::memory_order_acquire);
     }
 
-    void unlock() noexcept { lock_.store(false, std::memory_order_release); }
+    void unlock() noexcept {
+        me = -1;
+        lock_.store(false, std::memory_order_release);
+    }
 };
