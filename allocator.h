@@ -54,7 +54,7 @@ struct Allocator {
 };
 
 inline void *allocDeref(const Allocator *alloc, AllocRef ref) {
-    return *(void **)&ref;
+    // return *(void **)&ref;
 
     assert(ref.arenaID <= alloc->nArenas);
     assert(ref.arenaID != 0);

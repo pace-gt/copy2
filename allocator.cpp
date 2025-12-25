@@ -92,8 +92,8 @@ Allocator *createAllocator(size_t maxMemArenas, size_t diskSize,
 // Allocate a string of len
 // Note that len includes the null terminator
 AllocRef AllocatorAllocate(Allocator *alloc, size_t len) {
-    void *val = calloc(len, 1);
-    return *(AllocRef *)&val;
+    // void *val = calloc(len, 1);
+    // return *(AllocRef *)&val;
 
     assert(len);
     assert(alloc);
@@ -144,8 +144,8 @@ alloc_success:
 }
 
 void AllocatorFree(Allocator *alloc, AllocRef ref) {
-    free(*(void **)&ref);
-    return;
+    // free(*(void **)&ref);
+    // return;
 
     alloc->lock.lock();
     void *ptr = allocDeref(alloc, ref);

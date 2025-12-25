@@ -1154,7 +1154,7 @@ int main(int argc, char *argv[]) {
     sharedState->destRootFD = destRootFD;
     sharedState->srcRootFD = srcRootFD;
 
-    globalAllocator = createAllocator(0, 1ULL << 30, "copy2.mem");
+    globalAllocator = createAllocator(8, 1ULL << 40, "copy2.mem");
     if (!globalAllocator) {
         spdlog::error("failed to create allocator");
         return 1;
