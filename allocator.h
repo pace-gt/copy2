@@ -1,6 +1,7 @@
 #pragma once
 
 #include "buddy_alloc.h"
+
 #include "spdlog/spdlog.h"
 #include "spinlock.h"
 #include <cassert>
@@ -13,25 +14,26 @@
 #define ALLOC_MAX_ARENA_SIZE UINT32_MAX
 #define ALLOC_ARENA_SIZE ALLOC_MAX_ARENA_SIZE
 
+#define ALLOC_DEBUG
+
 static_assert(ALLOC_ARENA_SIZE <= ALLOC_MAX_ARENA_SIZE,
               "allocator arena size cannot exceed UINT32_MAX for "
               "indexing purposes");
 
+#ifdef ALLOC_DEBUG
+struct AllocDebug {
+    uint32_t canary; // = 0xDEADBEEF
+    uint32_t magic;
+    size_t size;
+};
+#endif
+
 struct AllocRef {
-    uint32_t arenaID;
-    uint32_t offset;
-};
+    void *ptr;
 
-enum ArenaType {
-    ARENA_MEMORY = 0,
-    ARENA_DISK,
-};
-
-struct AllocatorArena {
-    ArenaType type;
-    void *_metadata;
-    void *_data;
-    buddy *arena;
+#ifdef ALLOC_DEBUG
+    AllocDebug dbg;
+#endif
 };
 
 struct AllocatorDiskState {
@@ -44,33 +46,60 @@ struct AllocatorDiskState {
 struct Allocator {
     spinlock lock;
 
-    AllocatorDiskState diskState;
-
-    size_t maxMemArenas;
-    size_t nMemArenas;
-
-    uint32_t nArenas;
-    AllocatorArena *arenas;
+    buddy *diskAlloc;
+    buddy *memAlloc;
 };
 
-inline void *allocDeref(const Allocator *alloc, AllocRef ref) {
-    // return *(void **)&ref;
+inline void *allocDeref(const Allocator *alloc, AllocRef ref,
+                        size_t expectedSize = 0) {
+#ifdef ALLOC_DEBUG
+    // assert that the allocation ref thinks it's allocated
+    assert(ref.ptr);
+    assert(ref.dbg.size);
+    assert(ref.dbg.magic);
+    assert(ref.dbg.canary);
 
-    assert(ref.arenaID <= alloc->nArenas);
-    assert(ref.arenaID != 0);
-    assert(ref.offset <= ALLOC_MAX_ARENA_SIZE);
+    AllocDebug *dbg = (AllocDebug *)((uint8_t *)ref.ptr + ref.dbg.size);
 
-    return (uint8_t *)alloc->arenas[ref.arenaID - 1]._data + ref.offset;
+    // assert this is most likely allocated
+    assert(dbg->canary);
+    assert(dbg->magic);
+    assert(dbg->size);
+
+    // sanity
+    assert(ref.dbg.canary == 0xDEADBEEF);
+    assert(ref.dbg.magic > 0);
+    assert(ref.dbg.magic <= RAND_MAX + 1);
+    assert(dbg->magic > 0);
+    assert(dbg->magic <= RAND_MAX + 1);
+
+    // do they match?
+    assert(dbg->canary == ref.dbg.canary);
+    assert(dbg->magic == ref.dbg.magic);
+    assert(dbg->size == ref.dbg.size);
+
+    if (expectedSize) {
+        assert(dbg->size == expectedSize);
+    }
+#endif
+
+    return ref.ptr;
 }
 
 inline bool isNullRef(AllocRef ref) {
-    AllocRef zeroRef = {};
-    return !memcmp(&zeroRef, &ref, sizeof(AllocRef));
+    const AllocRef zeroRef = {};
+#ifdef ALLOC_DEBUG
+    assert((0 != ref.ptr) ==
+           (0 != memcmp(&ref.dbg, &zeroRef.dbg, sizeof(AllocDebug))));
+#endif
+
+    return !ref.ptr;
 }
 
-Allocator *createAllocator(size_t maxMemArenas, size_t diskSize,
+Allocator *createAllocator(size_t memSize, size_t diskSize,
                            const char *diskfilename);
 AllocRef AllocatorAllocate(Allocator *alloc, size_t len);
+AllocRef AllocatorAllocateRange(Allocator *alloc, size_t start, size_t len);
 void AllocatorFree(Allocator *alloc, AllocRef ref);
 
 // const size_t STRING_PART_MAX_LEN = 64 - sizeof(AllocRef) - 1;
@@ -82,6 +111,13 @@ struct StringPart {
     char data[];
 };
 
+inline StringPart *stringPartDeref(const Allocator *alloc, StringPartRef ref) {
+    StringPart *ptr = (StringPart *)allocDeref(alloc, ref);
+    ptr = (StringPart *)allocDeref(alloc, ref, ptr->len + sizeof(StringPart));
+
+    return ptr;
+}
+
 #define STRING_PART_RC_INC(alloc, ref)                                         \
     (((StringPart *)allocDeref(alloc, ref))->rc++, ref)
 
@@ -90,7 +126,7 @@ inline void stringPartRelease(Allocator *alloc, StringPartRef s) {
     StringPart *part;
     StringPartRef curRef = s;
     size_t i = 0;
-    while (!isNullRef(s) && (part = (StringPart *)allocDeref(alloc, curRef))) {
+    while (!isNullRef(s) && (part = stringPartDeref(alloc, curRef))) {
         i++;
         size_t rc = part->rc--;
         if (!rc) {
@@ -139,13 +175,15 @@ inline LinkEntryRef linkEntryAppend(Allocator *alloc, LinkEntryRef tip,
                                     LinkEntryRef next) {
     assert(!isNullRef(next));
     if (isNullRef(tip)) {
-        ((LinkEntry *)allocDeref(alloc, next))->prev = {};
+        ((LinkEntry *)allocDeref(alloc, next, sizeof(LinkEntryRef)))->prev = {};
         return next;
     }
 
-    ((LinkEntry *)allocDeref(alloc, next))->prev = tip;
+    ((LinkEntry *)allocDeref(alloc, next, sizeof(LinkEntryRef)))->prev = tip;
 
     return next;
 }
+
+void *buddy_base_ptr(buddy *bdy);
 
 extern Allocator *globalAllocator;

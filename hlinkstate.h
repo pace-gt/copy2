@@ -3,10 +3,9 @@
 #include "allocator.h"
 #include "filejob.h"
 #include "gtl/phmap.hpp"
+#include "gtl/phmap_fwd_decl.hpp"
 #include "lmdb.h"
 #include "spinlock.h"
-
-typedef gtl::flat_hash_map<uint64_t, AllocRef> pairmap;
 
 struct HLinkInfo {
     spinlock lock;
@@ -18,6 +17,30 @@ struct HLinkInfo {
     LinkEntryRef links;
     size_t nlinkRC;
 };
+
+template <typename T> struct HLinkCacheAllocator : std::allocator<T> {
+    T *allocate(size_t n) {
+        AllocRef ref = (AllocatorAllocate(
+            globalAllocator, sizeof(AllocRef) * n + sizeof(AllocRef)));
+
+        AllocRef *ptr = (AllocRef *)allocDeref(
+            globalAllocator, ref, (n) * sizeof(T) + sizeof(AllocRef));
+
+        *ptr = ref;
+
+        return (T *)(ptr + 1);
+    }
+
+    void free(T *ptr) {
+        AllocatorFree(globalAllocator, *((AllocRef *)ptr - 1));
+    }
+};
+
+typedef gtl::flat_hash_map<uint64_t, AllocRef,
+                           gtl::priv::hash_default_hash<uint64_t>,
+                           gtl::priv::hash_default_eq<uint64_t>,
+                           HLinkCacheAllocator<std::pair<uint64_t, AllocRef>>>
+    pairmap;
 
 struct HLinkState {
     pthread_rwlock_t lock;

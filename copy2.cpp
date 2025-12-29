@@ -5,6 +5,7 @@
 #include "filejob.h"
 #include "gtl/phmap_fwd_decl.hpp"
 #include "hlinkstate.h"
+#include "lightweightsemaphore.h"
 #include "logging.h"
 #include "spdlog/common.h"
 #include "spdlog/fmt/bundled/format.h"
@@ -37,9 +38,7 @@
 #include <sys/statfs.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
-
-#define BUDDY_ALLOC_IMPLEMENTATION
-#include "buddy_alloc.h"
+#include <utility>
 
 #define JOBS_PER_FILE 4
 #define BUF_SIZE (1024UL * 1024 * 128)
@@ -53,7 +52,65 @@ size_t done = 0;
 #define ISDOT(a) (a[0] == '.' && (!a[1] || (a[1] == '.' && !a[2])))
 
 struct QueueTraits : public moodycamel::ConcurrentQueueDefaultTraits {
-    static const size_t BLOCK_SIZE = 8192; // Use bigger blocks
+    static const size_t BLOCK_SIZE = 128; // Use bigger blocks
+    static inline void *malloc(size_t size) {
+        // wtf
+        // We store the allocation reference at the start of each allocation
+        // Crude, but it works
+        AllocRef ref =
+            AllocatorAllocate(globalAllocator, size + sizeof(AllocRef));
+        *(AllocRef *)allocDeref(globalAllocator, ref) = ref;
+        void *retPtr =
+            (uint8_t *)allocDeref(globalAllocator, ref) + sizeof(AllocRef);
+
+        return retPtr;
+    }
+
+    static inline void free(void *ptr) {
+        AllocatorFree(globalAllocator, *((AllocRef *)ptr - 1));
+    }
+};
+
+struct Queue {
+    moodycamel::BlockingConcurrentQueue<FileCopyJob, QueueTraits> q{0};
+    std::unique_ptr<moodycamel::details::Semaphore> enqueueSem;
+
+    Queue(size_t s)
+        : q{s},
+          enqueueSem(std::make_unique<moodycamel::details::Semaphore>(s)) {}
+
+    Queue(Queue &&other)
+        : q(std::move(other.q)), enqueueSem(std::move(other.enqueueSem)) {}
+
+    Queue &operator=(Queue &&other) {
+        q.swap(other.q);
+        enqueueSem.swap(other.enqueueSem);
+
+        return *this;
+    }
+
+    bool enqueue(FileCopyJob &&item) {
+        enqueueSem->wait();
+        return q.enqueue(item);
+    }
+
+    bool enqueue(FileCopyJob const &item) {
+        enqueueSem->wait();
+        return q.enqueue(item);
+    }
+
+    inline bool wait_dequeue_timed(FileCopyJob &item,
+                                   std::int64_t timeout_usecs) {
+        bool res = q.wait_dequeue_timed(item, timeout_usecs);
+
+        if (res) {
+            enqueueSem->signal();
+        }
+
+        return res;
+    }
+
+    size_t size_approx() { return q.size_approx(); }
 };
 
 // AT_EMPTY_PATH and AT_SYMLINK_NOFOLLOW on fchmodat is only supported on kernel
@@ -72,8 +129,8 @@ static inline int fchmodat_shim(int dirfd, const char *pathname, mode_t mode) {
 }
 
 struct SharedState {
-    moodycamel::BlockingConcurrentQueue<FileCopyJob, QueueTraits> jobQueue;
-    moodycamel::BlockingConcurrentQueue<FileCopyJob, QueueTraits> finishQueue;
+    Queue jobQueue{0};
+    Queue finishQueue{0};
 
     HLinkState hlinkState;
     sem_t fdSem;
@@ -121,7 +178,7 @@ char *readSymlink(Allocator *alloc, int srcFD, const char *path) {
     thread_local size_t size = INITIAL_READLINK_BUF_SIZE;
     thread_local AllocRef readlinkBuf = AllocatorAllocate(alloc, size);
 
-    char *bufPtr = (char *)allocDeref(alloc, readlinkBuf);
+    char *bufPtr = (char *)allocDeref(alloc, readlinkBuf, size);
     ssize_t nread = 0;
     while (1) {
         nread = readlinkat(srcFD, path, bufPtr, size);
@@ -141,7 +198,7 @@ char *readSymlink(Allocator *alloc, int srcFD, const char *path) {
             size += INITIAL_READLINK_BUF_SIZE;
             AllocatorFree(alloc, readlinkBuf);
             readlinkBuf = AllocatorAllocate(alloc, size);
-            char *bufPtr = (char *)allocDeref(alloc, readlinkBuf);
+            char *bufPtr = (char *)allocDeref(alloc, readlinkBuf, size);
         } else {
             bufPtr[nread] = '\0';
             break;
@@ -462,9 +519,8 @@ int schedulerTick(CopyScheduler *sched, SharedState *sharedState) {
     }
 }
 
-int schedulerUpdate(
-    CopyScheduler *sched, SharedState *sharedState,
-    moodycamel::BlockingConcurrentQueue<FileCopyJob, QueueTraits> &jobQueue) {
+int schedulerUpdate(CopyScheduler *sched, SharedState *sharedState,
+                    Queue &jobQueue) {
     // update current block jobs
     for (int i = 0; i < sched->nFileCopyJobs; i++) {
         FileCopyJob *fileJob = &sched->fileCopyJobs[i];
@@ -526,11 +582,10 @@ int schedulerUpdate(
 
     // schedule new jobs
     size_t activeJobs = 0; // this is not an accurate counter
-                           // for (int j = 0; j < 64; j++) {
     for (int i = 0; i < sched->nFileCopyJobs; i++) {
         FileCopyJob newJob;
         if (!sched->fileCopyJobs[i].active) {
-            if (jobQueue.try_dequeue(newJob)) {
+            if (jobQueue.wait_dequeue_timed(newJob, 100000)) {
                 sched->fileCopyJobs[i] = newJob;
                 sched->fileCopyJobs[i].nBlockJobsScheduled = 0;
                 sched->fileCopyJobs[i].nBlockJobsFinished = 0;
@@ -538,6 +593,8 @@ int schedulerUpdate(
                 sched->fileCopyJobs[i].active = true;
                 // activeJobs++;
 
+                // break;
+            } else {
                 break;
             }
         } else {
@@ -581,14 +638,15 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev,
 
     size_t suffixBufLen = 16 + std::strlen(".partial");
     char suffixBuf[suffixBufLen]; // if your compiler turns this into a vla,
-                                  // resconsider life
+                                  // reconsider life
 
-    const char *remote = (const char *)allocDeref(globalAllocator, remoteBuf);
+    const char *remote =
+        (const char *)allocDeref(globalAllocator, remoteBuf, remoteBufSize);
 
     snprintf(suffixBuf, suffixBufLen, "%016lX.partial",
              XXH3_64bits_withSeed(remote, strlen(remote), 0));
 
-    StringPart *pathPart = (StringPart *)allocDeref(globalAllocator, path);
+    StringPart *pathPart = stringPartDeref(globalAllocator, path);
     StringPartRef partialRef =
         toStringPart(globalAllocator, pathPart->prev, pathPart->data,
                      pathPart->len, suffixBuf, suffixBufLen);
@@ -597,7 +655,8 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev,
                                       &partialBufSize));
     assert(ok);
 
-    const char *partial = (const char *)allocDeref(globalAllocator, partialBuf);
+    const char *partial =
+        (const char *)allocDeref(globalAllocator, partialBuf, partialBufSize);
 
     bool shouldTransfer = false;
     bool exists = true;
@@ -766,7 +825,8 @@ int processDir(StringPartRef path, std::optional<dev_t> dev, size_t srcRootLen,
                                           &remoteBufSize));
     assert(ok);
 
-    const char *remote = (const char *)allocDeref(globalAllocator, remoteBuf);
+    const char *remote =
+        (const char *)allocDeref(globalAllocator, remoteBuf, remoteBufSize);
 
     sem_wait(&sharedState->fdSem);
     int fd = openat(srcRootFD, remote, O_RDONLY | O_DIRECTORY);
@@ -886,8 +946,8 @@ void finishProcessor(SharedState *sharedState) {
             int ok = (!stringrefMemcpyWithRealloc(
                 globalAllocator, fileJob.remote, &remoteBuf, &remoteBufSize));
             assert(ok);
-            const char *remote =
-                (const char *)allocDeref(globalAllocator, remoteBuf);
+            const char *remote = (const char *)allocDeref(
+                globalAllocator, remoteBuf, remoteBufSize);
 
             StringPartGuard partialPartGuard{globalAllocator, fileJob.partial};
             thread_local size_t partialBufSize = PATH_MAX;
@@ -900,8 +960,8 @@ void finishProcessor(SharedState *sharedState) {
                 assert(ok);
             }
 
-            const char *partial =
-                (const char *)allocDeref(globalAllocator, partialBuf);
+            const char *partial = (const char *)allocDeref(
+                globalAllocator, partialBuf, partialBufSize);
 
             struct statx destStx = {};
             if (statx(sharedState->destRootFD,
@@ -1121,19 +1181,36 @@ int main(int argc, char *argv[]) {
     double starttime = omp_get_wtime();
 
     SharedState *sharedState = new SharedState;
+    sharedState->jobQueue = Queue(30000);
+    sharedState->finishQueue = Queue{30000};
+
     // pthread_rwlock_init(&sharedState->hlinkState.lock, NULL);
     createHLinkState(&sharedState->hlinkState, "hlstate.db", 1000000,
                      1ULL << 30);
     sem_init(&sharedState->fdSem, 0, MAX_FILES);
 
-    size_t arena_size = 80UL * (1UL << 30);
-    void *buddy_metadata = malloc(buddy_sizeof_alignment(arena_size, 4096));
-    void *buddy_arena;
-    posix_memalign(&buddy_arena, 4096, arena_size);
+    globalAllocator = createAllocator(8 * 1ULL << 30, 1ULL << 40, "copy2.mem");
+    if (!globalAllocator) {
+        spdlog::error("failed to create allocator");
+        return 1;
+    }
 
-    sharedState->copybufferAllocator =
-        buddy_init_alignment((unsigned char *)buddy_metadata,
-                             (unsigned char *)buddy_arena, arena_size, 4096);
+    size_t arena_size = 80UL * (1UL << 30);
+
+    AllocRef copyArena = AllocatorAllocateRange(globalAllocator, 0, arena_size);
+    if (isNullRef(copyArena)) {
+        spdlog::error("failed to allocate copy buffer!");
+        return 1;
+    }
+
+    sharedState->copybufferAllocator = buddy_embed_alignment(
+        (unsigned char *)allocDeref(globalAllocator, copyArena, arena_size),
+        arena_size, 4096);
+
+    if (!sharedState->copybufferAllocator) {
+        spdlog::error("failed to create copy buffer allocator!");
+        return 1;
+    }
 
     omp_set_nested(1);
     omp_set_max_active_levels(INT32_MAX);
@@ -1153,12 +1230,6 @@ int main(int argc, char *argv[]) {
 
     sharedState->destRootFD = destRootFD;
     sharedState->srcRootFD = srcRootFD;
-
-    globalAllocator = createAllocator(8, 1ULL << 40, "copy2.mem");
-    if (!globalAllocator) {
-        spdlog::error("failed to create allocator");
-        return 1;
-    }
 
     StringPartRef rootRef =
         toStringPart(globalAllocator, {}, ".", 1, nullptr, 0);

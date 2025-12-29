@@ -180,7 +180,7 @@ reroll:
     *shouldTransfer = origShouldTransfer;
 
     if (haveSrcState) {
-        hinfo = (HLinkInfo *)allocDeref(alloc, hinfoRef);
+        hinfo = (HLinkInfo *)allocDeref(alloc, hinfoRef, sizeof(HLinkInfo));
         bool wrongInode = destInode != hinfo->destInode;
         if (!destExists || wrongInode) {
             thread_local size_t linkRootBufSize = 4096;
@@ -190,7 +190,8 @@ reroll:
             int ok = (!stringrefMemcpyWithRealloc(
                 alloc, hinfo->remote, &linkRootBuf, &linkRootBufSize));
             assert(ok);
-            const char *linkRoot = (const char *)allocDeref(alloc, linkRootBuf);
+            const char *linkRoot =
+                (const char *)allocDeref(alloc, linkRootBuf, linkRootBufSize);
 
             *shouldTransfer = false;
 
@@ -244,8 +245,8 @@ reroll:
                 LinkEntryRef entryRef =
                     AllocatorAllocate(alloc, sizeof(LinkEntry));
 
-                ((LinkEntry *)allocDeref(alloc, entryRef))->link =
-                    STRING_PART_RC_INC(alloc, remoteRef);
+                ((LinkEntry *)allocDeref(alloc, entryRef, sizeof(LinkEntry)))
+                    ->link = STRING_PART_RC_INC(alloc, remoteRef);
 
                 hinfo->links = linkEntryAppend(alloc, hinfo->links, entryRef);
 
@@ -276,7 +277,7 @@ reroll:
         *isFirstLook = true;
 
         hinfoRef = AllocatorAllocate(alloc, sizeof(HLinkInfo));
-        hinfo = (HLinkInfo *)allocDeref(alloc, hinfoRef);
+        hinfo = (HLinkInfo *)allocDeref(alloc, hinfoRef, sizeof(HLinkInfo));
         hinfo->links = {};
         hinfo->remote = STRING_PART_RC_INC(alloc, remoteRef);
         hinfo->destInode = destInode;
@@ -290,7 +291,8 @@ reroll:
 
         if (destExists && !origShouldTransfer) {
             if (haveDstState) {
-                revinfo = (HLinkInfoRev *)allocDeref(alloc, revinfoRef);
+                revinfo = (HLinkInfoRev *)allocDeref(alloc, revinfoRef,
+                                                     sizeof(HLinkInfoRev));
                 if (revinfo->srcInode != srcInode) {
                     spdlog::debug("Destination to source inode mapping {}->{} "
                                   "for {} doesn't match "
@@ -316,7 +318,8 @@ reroll_dststate:
         }
 
         revinfoRef = AllocatorAllocate(alloc, sizeof(HLinkInfoRev));
-        revinfo = (HLinkInfoRev *)allocDeref(alloc, revinfoRef);
+        revinfo =
+            (HLinkInfoRev *)allocDeref(alloc, revinfoRef, sizeof(HLinkInfoRev));
         assert(destNLinksExpected > 0);
         revinfo->nlinkRC = destNLinksExpected - 1;
         revinfo->srcInode = *shouldTransfer ? UINT64_MAX : srcInode;
@@ -325,7 +328,8 @@ reroll_dststate:
                   state->revTableCache, state->maxTableCacheSize, destInode,
                   revinfoRef);
     } else if (destExists && haveDstState) {
-        revinfo = (HLinkInfoRev *)allocDeref(alloc, revinfoRef);
+        revinfo =
+            (HLinkInfoRev *)allocDeref(alloc, revinfoRef, sizeof(HLinkInfoRev));
         revinfo->lock.lock();
         revinfo->nlinkRC--;
 
@@ -435,7 +439,8 @@ void hlinkStateHandleTransfer(const FileCopyJob &fileJob, HLinkState *state,
     HLinkInfo *hlinkinfo;
 
     if (haveHLinkState) {
-        hlinkinfo = (HLinkInfo *)allocDeref(alloc, hlinkinfoRef);
+        hlinkinfo =
+            (HLinkInfo *)allocDeref(alloc, hlinkinfoRef, sizeof(HLinkInfo));
         hlinkinfo->lock.lock();
         assert(!hlinkinfo->transferred);
         hlinkinfo->transferred = true;
@@ -443,7 +448,8 @@ void hlinkStateHandleTransfer(const FileCopyJob &fileJob, HLinkState *state,
 
         LinkEntryRef curRef = hlinkinfo->links;
         while (!isNullRef(curRef)) {
-            LinkEntry *entry = (LinkEntry *)allocDeref(alloc, curRef);
+            LinkEntry *entry =
+                (LinkEntry *)allocDeref(alloc, curRef, sizeof(LinkEntry));
 
             thread_local size_t linkRootBufSize = 4096;
             thread_local AllocRef linkRootBuf =
@@ -453,7 +459,8 @@ void hlinkStateHandleTransfer(const FileCopyJob &fileJob, HLinkState *state,
                 alloc, entry->link, &linkRootBuf, &linkRootBufSize));
             assert(ok);
 
-            const char *linkRoot = (const char *)allocDeref(alloc, linkRootBuf);
+            const char *linkRoot =
+                (const char *)allocDeref(alloc, linkRootBuf, linkRootBufSize);
 
             spdlog::trace("{} finish queue performing "
                           "pending link {} -> {}",

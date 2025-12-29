@@ -1,179 +1,221 @@
+#include <ranges>
+#define BUDDY_ALLOC_IMPLEMENTATION
 #include "allocator.h"
+#include <sys/mman.h>
 
 Allocator *globalAllocator = NULL;
 
-static AllocatorArena __AllocatorCreateMemoryArena() {
-    const size_t alignment =
-        128; // I assume here that for non-trivial projects the path length is
-             // going to be more than 64B in 90% of cases
-    void *arenaData = malloc(ALLOC_ARENA_SIZE);
-    void *arenaMetadata =
-        malloc(buddy_sizeof_alignment(ALLOC_ARENA_SIZE, alignment));
-
-    return {
-        .type = ARENA_MEMORY,
-        ._metadata = arenaMetadata,
-        ._data = arenaData,
-        .arena = buddy_init_alignment((unsigned char *)arenaMetadata,
-                                      (unsigned char *)arenaData,
-                                      ALLOC_ARENA_SIZE, alignment),
-    };
-}
-
-static AllocatorArena __AllocatorCreateDiskArena(Allocator *alloc) {
-    const size_t alignment =
-        128; // I assume here that for non-trivial projects the path length is
-             // going to be more than 64B in 90% of cases
-    if (alloc->diskState.offset + ALLOC_ARENA_SIZE > alloc->diskState.maxSize) {
-        spdlog::error("Allocator is out of disk space!");
-        exit(1);
-    }
-
-    void *arenaData =
-        (uint8_t *)alloc->diskState.data + alloc->diskState.offset;
-    alloc->diskState.offset += ALLOC_ARENA_SIZE;
-    void *arenaMetadata =
-        malloc(buddy_sizeof_alignment(ALLOC_ARENA_SIZE, alignment));
-
-    spdlog::info("arenaData {}, arenaMetadata {}", arenaData, arenaMetadata);
-
-    return {
-        .type = ARENA_DISK,
-        ._metadata = arenaMetadata,
-        ._data = arenaData,
-        .arena = buddy_init_alignment((unsigned char *)arenaMetadata,
-                                      (unsigned char *)arenaData,
-                                      ALLOC_ARENA_SIZE, alignment),
-    };
-}
-
-Allocator *createAllocator(size_t maxMemArenas, size_t diskSize,
+Allocator *createAllocator(size_t memSize, size_t diskSize,
                            const char *diskfilename) {
-    Allocator *alloc = (Allocator *)calloc(1, sizeof(Allocator));
 
-    int fd = open(diskfilename, O_RDWR | O_CREAT);
-    if (fd < 0) {
-        spdlog::error("Failed to open allocator disk backing file {}: {}",
-                      diskfilename, strerror(errno));
-        exit(1);
+    Allocator *alloc = NULL;
+    buddy *memAlloc = NULL;
+    if (memSize) {
+        void *mem = mmap(NULL, memSize, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+        if (mem == (void *)-1) {
+            spdlog::error("Failed to mmap memory buffer: {}", strerror(errno));
+            exit(1);
+        }
+
+        memAlloc = buddy_embed_alignment((uint8_t *)memAlloc, memSize, 128);
+
+        if (!memAlloc) {
+            spdlog::error("Failed to embed memory allocator");
+            exit(1);
+        }
+
+        alloc = (Allocator *)buddy_calloc(memAlloc, 1, sizeof(Allocator));
     }
 
-    if (ftruncate(fd, diskSize) < 0) {
-        spdlog::error(
-            "Failed to ftruncate allocator disk backing file {} to size {}: {}",
-            diskfilename, diskSize, strerror(errno));
-        exit(1);
-    }
+    if (diskSize) {
+        int fd = open(diskfilename, O_RDWR | O_CREAT);
+        if (fd < 0) {
+            spdlog::error("Failed to open allocator disk backing file {}: {}",
+                          diskfilename, strerror(errno));
+            exit(1);
+        }
 
-    alloc->maxMemArenas = maxMemArenas;
+        if (ftruncate(fd, diskSize) < 0) {
+            spdlog::error("Failed to ftruncate allocator disk backing file {} "
+                          "to size {}: {}",
+                          diskfilename, diskSize, strerror(errno));
+            exit(1);
+        }
 
-    alloc->diskState = {};
-    alloc->diskState.fd = fd;
-    alloc->diskState.offset = 0;
-    alloc->diskState.maxSize = diskSize;
+        // struct rlimit rlim = {};
+        // getrlimit(RLIMIT_DATA, &rlim);
 
-    struct rlimit rlim = {};
-    getrlimit(RLIMIT_DATA, &rlim);
+        // spdlog::info("diskSize: {}", diskSize);
+        // spdlog::info("RLIMIT_DATA: {}, {}", rlim.rlim_cur, rlim.rlim_max);
 
-    spdlog::info("diskSize: {}", diskSize);
-    spdlog::info("RLIMIT_DATA: {}, {}", rlim.rlim_cur, rlim.rlim_max);
+        void *data =
+            mmap(NULL, diskSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (data == (void *)-1) {
+            spdlog::error("Failed to mmap allocator disk backing file: {}({})",
+                          errno, strerror(errno));
+            exit(1);
+        }
 
-    alloc->diskState.data =
-        mmap(NULL, diskSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (alloc->diskState.data == (void *)-1) {
-        spdlog::error("Failed to mmap allocator disk backing file: {}({})",
-                      errno, strerror(errno));
-        exit(1);
+        buddy *diskAlloc = buddy_embed((uint8_t *)data, diskSize);
+
+        if (!diskAlloc) {
+            spdlog::error("Failed to embed disk allocator");
+            exit(1);
+        }
+
+        if (!alloc) {
+            alloc = (Allocator *)buddy_calloc(diskAlloc, 1, sizeof(Allocator));
+        }
+
+        if (alloc) {
+            alloc->diskAlloc = diskAlloc;
+        }
     }
 
     return alloc;
 }
 
-// Allocate a string of len
-// Note that len includes the null terminator
 AllocRef AllocatorAllocate(Allocator *alloc, size_t len) {
     // void *val = calloc(len, 1);
     // return *(AllocRef *)&val;
 
     assert(len);
     assert(alloc);
-    assert(len <= UINT32_MAX);
 
     alloc->lock.lock();
 
-    void *allocated = NULL;
-    uint32_t arena = 0;
-    // I assume that the number of arenas for this application will be
-    // relatively low so we can iterate through all of them to prioritize
-    // compactness
-    for (; arena < alloc->nArenas; arena++) {
-        allocated = buddy_calloc(alloc->arenas[arena].arena, 1, len);
+    void *allocation = NULL;
 
-        if (allocated) {
-            goto alloc_success;
-        }
+#ifdef ALLOC_DEBUG
+    AllocDebug dbg = {
+        .canary = 0xDEADBEEF,
+        .magic = (uint32_t)rand(),
+        .size = len,
+    };
+    len += sizeof(AllocDebug);
+#endif
+
+    if (alloc->memAlloc) {
+        allocation = buddy_calloc(alloc->memAlloc, 1, len);
     }
 
-    arena = alloc->nArenas++;
-    alloc->arenas = (AllocatorArena *)realloc(
-        alloc->arenas, sizeof(AllocatorArena) * alloc->nArenas);
-    if (alloc->nMemArenas < alloc->maxMemArenas) {
-        alloc->arenas[alloc->nArenas - 1] = __AllocatorCreateMemoryArena();
-    } else {
-        spdlog::info("creating disk allocator...");
-        alloc->arenas[alloc->nArenas - 1] = __AllocatorCreateDiskArena(alloc);
+    if (!allocation && alloc->diskAlloc) {
+        allocation = buddy_calloc(alloc->diskAlloc, 1, len);
     }
 
-    spdlog::info("arena is {}",
-                 (void *)alloc->arenas[alloc->nArenas - 1].arena);
-    allocated = buddy_calloc(alloc->arenas[alloc->nArenas - 1].arena, 1, len);
-
-alloc_success:
-    assert(allocated);
-    int64_t offset =
-        (uint8_t *)allocated - (uint8_t *)alloc->arenas[arena]._data;
-    assert(offset >= 0);
-    assert(offset <= UINT32_MAX);
+#ifdef ALLOC_DEBUG
+    if (allocation) {
+        *(AllocDebug *)((uint8_t *)alloc + len - sizeof(AllocDebug)) = dbg;
+    }
+#endif
 
     alloc->lock.unlock();
 
+    assert(allocation);
     return {
-        .arenaID = arena + 1,
-        .offset = (uint32_t)offset,
+        .ptr = allocation,
+    };
+}
+
+AllocRef AllocatorAllocateRange(Allocator *alloc, size_t offset, size_t len) {
+    // void *val = calloc(len, 1);
+    // return *(AllocRef *)&val;
+
+    assert(len);
+    assert(alloc);
+
+    alloc->lock.lock();
+
+    void *allocation = NULL;
+
+#ifdef ALLOC_DEBUG
+    AllocDebug dbg = {
+        .canary = 0xDEADBEEF,
+        .magic = (uint32_t)rand(),
+        .size = len,
+    };
+    len += sizeof(AllocDebug);
+#endif
+
+    if (alloc->memAlloc) {
+        char *base = (char *)buddy_base_ptr(alloc->memAlloc);
+        char *allocBase = base + offset;
+        if (!(allocBase < base) &&
+            !((allocBase + len) > (base + alloc->memAlloc->memory_size))) {
+            buddy_reserve_range(alloc->memAlloc, allocBase, len);
+            allocation = allocBase;
+        }
+    }
+
+    if (!allocation && alloc->diskAlloc) {
+        char *base = (char *)buddy_base_ptr(alloc->diskAlloc);
+        char *allocBase = base + offset;
+        if (!(allocBase < base) &&
+            !((allocBase + len) > (base + alloc->diskAlloc->memory_size))) {
+            buddy_reserve_range(alloc->diskAlloc, allocBase, len);
+            allocation = allocBase;
+        }
+    }
+
+#ifdef ALLOC_DEBUG
+    if (allocation) {
+        *(AllocDebug *)((uint8_t *)alloc + len - sizeof(AllocDebug)) = dbg;
+    }
+#endif
+
+    alloc->lock.unlock();
+
+    assert(allocation);
+    return {
+        .ptr = allocation,
     };
 }
 
 void AllocatorFree(Allocator *alloc, AllocRef ref) {
-    // free(*(void **)&ref);
-    // return;
-
     alloc->lock.lock();
     void *ptr = allocDeref(alloc, ref);
 
-    assert(ref.arenaID <= alloc->nArenas);
-    assert(ref.arenaID != 0);
+#ifdef ALLOC_DEBUG
+    buddy_safe_free_status status = buddy_safe_free(
+        alloc->memAlloc, ptr, ref.dbg.size + sizeof(AllocDebug));
 
-    buddy_free(alloc->arenas[ref.arenaID - 1].arena, ptr);
+    if (status == BUDDY_SAFE_FREE_INVALID_ADDRESS) {
+        status = buddy_safe_free(alloc->diskAlloc, ptr,
+                                 ref.dbg.size = sizeof(AllocDebug));
+    }
+
+    assert(status != BUDDY_SAFE_FREE_ALREADY_FREE);
+    assert(status != BUDDY_SAFE_FREE_INVALID_ADDRESS);
+    assert(status != BUDDY_SAFE_FREE_SIZE_MISMATCH);
+    assert(status != BUDDY_SAFE_FREE_BUDDY_IS_NULL);
+    assert(status == BUDDY_SAFE_FREE_SUCCESS);
+
+    memset(ptr, 0, ref.dbg.size + sizeof(AllocDebug));
+#else
+    buddy_free(alloc->memAlloc, ptr);
+    buddy_free(alloc->diskAlloc, ptr);
+#endif
     alloc->lock.unlock();
 }
 
 int stringrefMemcpyWithRealloc(Allocator *alloc, StringPartRef ref,
                                AllocRef *buf, size_t *bufsize) {
     memset((void *)allocDeref(alloc, *buf), 0, *bufsize);
-    size_t len =
-        stringRefMemcpy(alloc, ref, (char *)allocDeref(alloc, *buf), *bufsize);
+    size_t len = stringRefMemcpy(
+        alloc, ref, (char *)allocDeref(alloc, *buf, *bufsize), *bufsize);
     if (len >= *bufsize) {
         *bufsize = len;
         AllocatorFree(alloc, *buf);
         *buf = AllocatorAllocate(alloc, *bufsize);
 
-        if (len !=
-            stringRefMemcpy(alloc, ref, (char *)allocDeref(alloc, *buf), len)) {
+        if (len != stringRefMemcpy(alloc, ref,
+                                   (char *)allocDeref(alloc, *buf, *bufsize),
+                                   len)) {
             return 1;
         }
     }
-
-    // fprintf(stderr, "result: %s\n", (char *)allocDeref(alloc, *buf));
 
     return 0;
 }
@@ -182,18 +224,30 @@ StringPartRef toStringPart(Allocator *alloc, StringPartRef currentTip,
                            const char *s1, size_t len1, const char *s2,
                            size_t len2) {
     if (!isNullRef(currentTip)) {
-        StringPart *prevPart = (StringPart *)allocDeref(alloc, currentTip);
+        StringPart *prevPart = stringPartDeref(alloc, currentTip);
         STRING_PART_RC_INC(alloc, currentTip);
     }
-    // prevPart->rc++;
 
     StringPartRef cur =
         AllocatorAllocate(alloc, sizeof(StringPart) + len1 + len2);
 
-    StringPart *part = (StringPart *)allocDeref(alloc, cur);
+    StringPart *part = stringPartDeref(alloc, cur);
     part->len = len1 + len2;
+
+#ifdef ALLOC_DEBUG
+    char *bp = (char *)part;
+    char *maxp = (char *)part + cur.dbg.size;
+
+    assert((part->data) >= bp);
+    assert((part->data + len1) <= maxp);
+#endif
     memcpy(part->data, s1, len1);
+
     if (len2) {
+#ifdef ALLOC_DEBUG
+        assert((part->data + len1 + len2) <= maxp);
+        assert((part->data + len1) >= bp);
+#endif
         memcpy(part->data + len1, s2, len2);
     }
     part->rc = 1;
@@ -208,7 +262,7 @@ const char *stringrefImmediateToCString(Allocator *alloc, StringPartRef ref) {
 
     stringrefMemcpyWithRealloc(alloc, ref, &remoteBuf, &bufSize);
 
-    return (const char *)allocDeref(alloc, remoteBuf);
+    return (const char *)allocDeref(alloc, remoteBuf, bufSize);
 }
 
 size_t stringRefMemcpy(const Allocator *alloc, StringPartRef ref, char *buf,
@@ -227,7 +281,7 @@ size_t stringRefMemcpy(const Allocator *alloc, StringPartRef ref, char *buf,
     }
 
     while (!isNullRef(cur)) {
-        StringPart *part = (StringPart *)allocDeref(alloc, cur);
+        StringPart *part = stringPartDeref(alloc, cur);
         size += part->len;
 
         cur = part->prev;
@@ -242,16 +296,18 @@ size_t stringRefMemcpy(const Allocator *alloc, StringPartRef ref, char *buf,
     cur = ref;
     if (buf) {
         while (!isNullRef(cur)) {
-            StringPart *part = (StringPart *)allocDeref(alloc, cur);
+            StringPart *part = stringPartDeref(alloc, cur);
             it += part->len;
 
-            // fprintf(stderr, "memcpy %.*s, %zu\n", (int)part->len, part->data,
-            // size - it - 1);
+            assert((size - it - 1) >= 0);
+            assert((size - it - 1 + part->len) <= bufsize);
+
             memcpy(buf + size - it - 1, part->data, part->len);
 
             cur = part->prev;
         }
 
+        assert(size <= bufsize);
         buf[size - 1] = '\0';
     }
 
@@ -259,3 +315,5 @@ size_t stringRefMemcpy(const Allocator *alloc, StringPartRef ref, char *buf,
 
     return size;
 }
+
+void *buddy_base_ptr(buddy *bdy) { return buddy_main(bdy); }
