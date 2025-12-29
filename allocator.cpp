@@ -27,6 +27,10 @@ Allocator *createAllocator(size_t memSize, size_t diskSize,
         }
 
         alloc = (Allocator *)buddy_calloc(memAlloc, 1, sizeof(Allocator));
+
+        if (alloc) {
+            alloc->memAlloc = memAlloc;
+        }
     }
 
     if (diskSize) {
