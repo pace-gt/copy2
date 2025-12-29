@@ -69,9 +69,9 @@ inline void *allocDeref(const Allocator *alloc, AllocRef ref,
     // sanity
     assert(ref.dbg.canary == 0xDEADBEEF);
     assert(ref.dbg.magic > 0);
-    assert(ref.dbg.magic <= RAND_MAX + 1);
+    assert(ref.dbg.magic <= (uint32_t)RAND_MAX + 1);
     assert(dbg->magic > 0);
-    assert(dbg->magic <= RAND_MAX + 1);
+    assert(dbg->magic <= (uint32_t)RAND_MAX + 1);
 
     // do they match?
     assert(dbg->canary == ref.dbg.canary);

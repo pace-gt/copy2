@@ -3,12 +3,10 @@
 #include "bytesize.hh"
 #include "concurrentqueue.h"
 #include "filejob.h"
-#include "gtl/phmap_fwd_decl.hpp"
 #include "hlinkstate.h"
 #include "lightweightsemaphore.h"
 #include "logging.h"
 #include "spdlog/common.h"
-#include "spdlog/fmt/bundled/format.h"
 #include "spdlog/sinks/basic_file_sink.h"
 #include "spdlog/sinks/stdout_color_sinks.h"
 #include "spdlog/spdlog.h"
@@ -184,21 +182,20 @@ char *readSymlink(Allocator *alloc, int srcFD, const char *path) {
         nread = readlinkat(srcFD, path, bufPtr, size);
 
         if (nread < 0) {
-            fprintf(stderr,
-                    "ERROR: readlink failed to read symlink \"%s\" "
-                    "(errorcode %ld)\n",
-                    path, errno);
+            spdlog::error("readlink failed to read symlink {}"
+                          "({})\n",
+                          path, strerror(errno));
             return nullptr;
         } else if (nread == 0) {
             bufPtr[0] = '\0';
             break;
         }
 
-        if (nread >= size) {
+        if ((size_t)nread >= size) {
             size += INITIAL_READLINK_BUF_SIZE;
             AllocatorFree(alloc, readlinkBuf);
             readlinkBuf = AllocatorAllocate(alloc, size);
-            char *bufPtr = (char *)allocDeref(alloc, readlinkBuf, size);
+            bufPtr = (char *)allocDeref(alloc, readlinkBuf, size);
         } else {
             bufPtr[nread] = '\0';
             break;
@@ -218,7 +215,7 @@ static void wr_done(io_context_t ctx, struct iocb *iocb, long res, long res2) {
     job->status = 0;
     if (res <= 0)
         job->status = -res;
-    else if (res != iocb->u.c.nbytes) {
+    else if ((unsigned long)res != iocb->u.c.nbytes) {
         fprintf(stderr, "ERROR: write missed bytes expect %lu got %ld\n",
                 iocb->u.c.nbytes, res);
     }
@@ -234,7 +231,7 @@ static void rd_done(io_context_t ctx, struct iocb *iocb, long res, long res2) {
     job->status = 0;
     if (res <= 0)
         job->status = -res;
-    else if (res != iocb->u.c.nbytes) {
+    else if ((unsigned long)res != iocb->u.c.nbytes) {
         spdlog::error("{}: read missed bytes expected {} got {}", *job,
                       iocb->u.c.nbytes, res);
         job->status = EIO;
@@ -261,12 +258,20 @@ int createScheduler(CopyScheduler *sched, size_t nFileCopyJobs,
         .done = false,
         .nFileCopyJobs = nFileCopyJobs,
         .nBlockCopyJobsPerFileCopyJob = nBlockCopyJobsPerFileCopyJob,
-        .fileCopyJobs =
-            (FileCopyJob *)calloc(nFileCopyJobs, sizeof(FileCopyJob)),
-        .blockCopyJobs = (BlockCopyJob *)calloc(
-            nBlockCopyJobsPerFileCopyJob * nFileCopyJobs, sizeof(BlockCopyJob)),
-        .cbBatch = (iocb **)calloc(nFileCopyJobs * nBlockCopyJobsPerFileCopyJob,
-                                   sizeof(iocb *)),
+        .fileCopyJobs = (FileCopyJob *)allocDeref(
+            globalAllocator,
+            AllocatorAllocate(globalAllocator,
+                              nFileCopyJobs * sizeof(FileCopyJob))),
+        .blockCopyJobs = (BlockCopyJob *)allocDeref(
+            globalAllocator,
+            AllocatorAllocate(globalAllocator, nBlockCopyJobsPerFileCopyJob *
+                                                   nFileCopyJobs *
+                                                   sizeof(BlockCopyJob))),
+        .cbBatch = (iocb **)allocDeref(
+            globalAllocator,
+            AllocatorAllocate(globalAllocator,
+                              nFileCopyJobs * nBlockCopyJobsPerFileCopyJob *
+                                  sizeof(iocb *))),
         .cbBatchSize = 0,
     };
 
@@ -380,7 +385,7 @@ inline void schedulerScheduleBlockCopyJob(CopyScheduler *sched,
     io_prep_pread(&blockJob->cb, fileJob->srcFd, blockJob->data,
                   blockJob->nbytes, blockJob->offset);
 
-    iocb *cbp = &blockJob->cb;
+    // iocb *cbp = &blockJob->cb;
     io_set_callback(&blockJob->cb, rd_done);
 
     schedIOSubmitDeferred(sched, &blockJob->cb);
@@ -398,7 +403,7 @@ inline void schedulerUpdateBlockCopyJob(CopyScheduler *sched,
 
             io_prep_pwrite(&blockJob->cb, blockJob->parent->dstFd,
                            blockJob->data, blockJob->nbytes, blockJob->offset);
-            iocb *cbp = &blockJob->cb;
+            // iocb *cbp = &blockJob->cb;
             blockJob->status = EINPROGRESS;
             blockJob->type = WRITE;
             io_set_callback(&blockJob->cb, wr_done);
@@ -421,7 +426,7 @@ inline void schedulerUpdateBlockCopyJob(CopyScheduler *sched,
             memset(blockJob->data, 0, blockJob->nbytes);
             io_prep_pread(&blockJob->cb, blockJob->parent->dstFd,
                           blockJob->data, blockJob->nbytes, blockJob->offset);
-            iocb *cbp = &blockJob->cb;
+            // iocb *cbp = &blockJob->cb;
             blockJob->status = EINPROGRESS;
             blockJob->type = READDST;
             io_set_callback(&blockJob->cb, rd_done);
@@ -522,7 +527,7 @@ int schedulerTick(CopyScheduler *sched, SharedState *sharedState) {
 int schedulerUpdate(CopyScheduler *sched, SharedState *sharedState,
                     Queue &jobQueue) {
     // update current block jobs
-    for (int i = 0; i < sched->nFileCopyJobs; i++) {
+    for (size_t i = 0; i < sched->nFileCopyJobs; i++) {
         FileCopyJob *fileJob = &sched->fileCopyJobs[i];
         if (!fileJob->active) {
             continue;
@@ -541,7 +546,7 @@ int schedulerUpdate(CopyScheduler *sched, SharedState *sharedState,
 
     // check for file job completion
     // schedule new block jobs
-    for (int i = 0; i < sched->nFileCopyJobs; i++) {
+    for (size_t i = 0; i < sched->nFileCopyJobs; i++) {
         FileCopyJob *fileJob = &sched->fileCopyJobs[i];
         if (!fileJob->active) {
             continue;
@@ -582,7 +587,7 @@ int schedulerUpdate(CopyScheduler *sched, SharedState *sharedState,
 
     // schedule new jobs
     size_t activeJobs = 0; // this is not an accurate counter
-    for (int i = 0; i < sched->nFileCopyJobs; i++) {
+    for (size_t i = 0; i < sched->nFileCopyJobs; i++) {
         FileCopyJob newJob;
         if (!sched->fileCopyJobs[i].active) {
             if (jobQueue.wait_dequeue_timed(newJob, 100000)) {
@@ -601,8 +606,8 @@ int schedulerUpdate(CopyScheduler *sched, SharedState *sharedState,
             // activeJobs++;
         }
     }
-    // }
-    for (int i = 0; i < sched->nFileCopyJobs; i++) {
+
+    for (size_t i = 0; i < sched->nFileCopyJobs; i++) {
         activeJobs += (size_t)(sched->fileCopyJobs[i].active);
     }
 
@@ -636,9 +641,11 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev,
                                           &remoteBufSize));
     assert(ok);
 
-    size_t suffixBufLen = 16 + std::strlen(".partial");
-    char suffixBuf[suffixBufLen]; // if your compiler turns this into a vla,
-                                  // reconsider life
+#define SUFFIX_BUF_LEN (16 + std::strlen(".partial") + 1)
+    const size_t suffixBufLen = SUFFIX_BUF_LEN;
+    char suffixBuf[SUFFIX_BUF_LEN]; // if your compiler turns this into a vla,
+                                    // reconsider life
+#undef SUFFIX_BUF_LEN
 
     const char *remote =
         (const char *)allocDeref(globalAllocator, remoteBuf, remoteBufSize);
@@ -649,7 +656,7 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev,
     StringPart *pathPart = stringPartDeref(globalAllocator, path);
     StringPartRef partialRef =
         toStringPart(globalAllocator, pathPart->prev, pathPart->data,
-                     pathPart->len, suffixBuf, suffixBufLen);
+                     pathPart->len, suffixBuf, suffixBufLen - 1);
     StringPartGuard partialRefGuard{globalAllocator, partialRef};
     ok = (!stringrefMemcpyWithRealloc(globalAllocator, partialRef, &partialBuf,
                                       &partialBufSize));
@@ -686,7 +693,6 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev,
 
     sharedState->filesSeen++;
 
-reroll:
     shouldTransfer = !exists;
     shouldTransfer |= memcmp(&stx.stx_mtime, &destStx.stx_mtime,
                              sizeof(stx.stx_mtime)) != 0 ||
@@ -917,7 +923,7 @@ int processDir(StringPartRef path, std::optional<dev_t> dev, size_t srcRootLen,
 void finishProcessor(SharedState *sharedState) {
     while (true) {
         bool done = true;
-        for (int i = 0; i < sharedState->nscheds; i++) {
+        for (size_t i = 0; i < sharedState->nscheds; i++) {
             if (!sharedState->scheds[i].done) {
                 done = false;
             }
@@ -1070,7 +1076,7 @@ void incrementalLogger(SharedState *sharedState) {
     bool quit = false;
     while (true) {
         bool done = true;
-        for (int i = 0; i < sharedState->nscheds; i++) {
+        for (size_t i = 0; i < sharedState->nscheds; i++) {
             if (!sharedState->scheds[i].done) {
                 done = false;
             }
@@ -1218,7 +1224,7 @@ int main(int argc, char *argv[]) {
     const int nScheds = 8; // omp_get_max_threads();
     CopyScheduler *scheds = new CopyScheduler[nScheds];
 
-    for (int i = 0; i < nScheds; i++) {
+    for (size_t i = 0; i < nScheds; i++) {
         CopyScheduler &sched = scheds[i];
         if (createScheduler(&sched, 2048, 16)) {
             exit(1);
