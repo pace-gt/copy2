@@ -116,6 +116,9 @@ AllocRef AllocatorAllocate(Allocator *alloc, size_t len) {
     assert(allocation);
     return {
         .ptr = allocation,
+#ifdef ALLOC_DEBUG
+        .dbg = dbg,
+#endif
     };
 }
 
