@@ -1186,6 +1186,12 @@ int main(int argc, char *argv[]) {
     spdlog::info("copying files from {} to {}", argv[1], argv[2]);
     double starttime = omp_get_wtime();
 
+    globalAllocator = createAllocator(8 * 1ULL << 30, 1ULL << 40, "copy2.mem");
+    if (!globalAllocator) {
+        spdlog::error("failed to create allocator");
+        return 1;
+    }
+
     SharedState *sharedState = new SharedState;
     sharedState->jobQueue = Queue(30000);
     sharedState->finishQueue = Queue{30000};
@@ -1194,12 +1200,6 @@ int main(int argc, char *argv[]) {
     createHLinkState(&sharedState->hlinkState, "hlstate.db", 1000000,
                      1ULL << 30);
     sem_init(&sharedState->fdSem, 0, MAX_FILES);
-
-    globalAllocator = createAllocator(8 * 1ULL << 30, 1ULL << 40, "copy2.mem");
-    if (!globalAllocator) {
-        spdlog::error("failed to create allocator");
-        return 1;
-    }
 
     size_t arena_size = 80UL * (1UL << 30);
 
