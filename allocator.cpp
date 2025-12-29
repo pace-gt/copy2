@@ -107,7 +107,7 @@ AllocRef AllocatorAllocate(Allocator *alloc, size_t len) {
 
 #ifdef ALLOC_DEBUG
     if (allocation) {
-        *(AllocDebug *)((uint8_t *)alloc + len - sizeof(AllocDebug)) = dbg;
+        *(AllocDebug *)((uint8_t *)allocation + len - sizeof(AllocDebug)) = dbg;
     }
 #endif
 
@@ -164,7 +164,7 @@ AllocRef AllocatorAllocateRange(Allocator *alloc, size_t offset, size_t len) {
 
 #ifdef ALLOC_DEBUG
     if (allocation) {
-        *(AllocDebug *)((uint8_t *)alloc + len - sizeof(AllocDebug)) = dbg;
+        *(AllocDebug *)((uint8_t *)allocation + len - sizeof(AllocDebug)) = dbg;
     }
 #endif
 
@@ -173,6 +173,9 @@ AllocRef AllocatorAllocateRange(Allocator *alloc, size_t offset, size_t len) {
     assert(allocation);
     return {
         .ptr = allocation,
+#ifdef ALLOC_DEBUG
+        .dbg = dbg,
+#endif
     };
 }
 
