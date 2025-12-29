@@ -19,7 +19,7 @@ Allocator *createAllocator(size_t memSize, size_t diskSize,
             exit(1);
         }
 
-        memAlloc = buddy_embed_alignment((uint8_t *)memAlloc, memSize, 128);
+        memAlloc = buddy_embed_alignment((uint8_t *)mem, memSize, 128);
 
         if (!memAlloc) {
             spdlog::error("Failed to embed memory allocator");
