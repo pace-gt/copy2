@@ -91,7 +91,7 @@ Allocator *createAllocator(size_t memSize, size_t diskSize,
         }
     }
 
-    if(alloc) {
+    if (alloc) {
         alloc->copyBuffer = copyBuffer;
     }
 
@@ -240,6 +240,7 @@ int stringrefMemcpyWithRealloc(Allocator *alloc, StringPartRef ref,
         if (len != stringRefMemcpy(alloc, ref,
                                    (char *)allocDeref(alloc, *buf, *bufsize),
                                    len)) {
+            assert(false);
             return 1;
         }
     }

@@ -217,7 +217,7 @@ reroll:
                                           destRootFD, remote, 0) < 0) {
                     spdlog::error("Failed to hardlink root {} to {}: {}",
                                   linkRoot, remote, strerror(errno));
-                    exit(1);
+                    return;
                 }
 
                 hinfo->nlinkRC--; // this can underflow, however it's fine
@@ -237,7 +237,7 @@ reroll:
                         deletePair(state, state->wrTxn, state->env,
                                    state->forwardTable,
                                    state->forwardTableCache, srcInode);
-                        // AllocatorFree(alloc, hinfoRef);
+                        AllocatorFree(alloc, hinfoRef);
                     }
                     hinfoRef = {};
                     hinfo = NULL;
@@ -348,6 +348,7 @@ reroll_dststate:
 
             if (readPair(state->wrTxn, state->env, state->revTableCache,
                          state->revTable, destInode, &revinfoRef)) {
+                revinfo->lock.lock();
                 deletePair(state, state->wrTxn, state->env, state->revTable,
                            state->revTableCache, destInode);
                 AllocatorFree(alloc, revinfoRef);
@@ -360,6 +361,8 @@ reroll_dststate:
     }
 
     pthread_rwlock_unlock(&state->lock);
+
+    assert(!(*isPendingHardlink && *isFirstLook));
 }
 
 void createHLinkState(HLinkState *state, const char *path,

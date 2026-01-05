@@ -39,9 +39,11 @@ extern struct TestingSyscallBehaviorMatrix {
             TESTING_SYSCALL_BEHAVIOR statx;
             TESTING_SYSCALL_BEHAVIOR linkat;
             TESTING_SYSCALL_BEHAVIOR unlinkat;
+            TESTING_SYSCALL_BEHAVIOR mkdirat;
+            TESTING_SYSCALL_BEHAVIOR readdir;
         } s;
 
-        TESTING_SYSCALL_BEHAVIOR arr[14];
+        TESTING_SYSCALL_BEHAVIOR arr[15];
     };
 } testingSyscallBehaviorMatrix;
 
@@ -269,4 +271,22 @@ inline int unlinkat_wrapper(SharedState *sharedState, int dirfd,
     assert(sharedState->destRootFD == dirfd);
 
     return unlinkat(dirfd, path, flags);
+}
+
+inline int mkdirat_wrapper(SharedState *sharedState, int dirfd,
+                           const char *path, mode_t mode) {
+    TESTING_ASSERT_SYSCALL_BEHAVIOR(mkdirat, -1);
+    assert(path_ok(path));
+    assert(path);
+    assert(dirfd >= 0);
+    assert(sharedState->destRootFD == dirfd);
+
+    return mkdirat(dirfd, path, mode);
+}
+
+inline dirent *readdir_wrapper(SharedState *sharedState, DIR *dir) {
+    TESTING_ASSERT_SYSCALL_BEHAVIOR(mkdirat, NULL);
+    assert(dir);
+
+    return readdir(dir);
 }
