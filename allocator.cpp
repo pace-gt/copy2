@@ -6,10 +6,11 @@
 Allocator *globalAllocator = NULL;
 
 Allocator *createAllocator(size_t memSize, size_t diskSize,
-                           const char *diskfilename) {
+                           size_t copyBufferSize, const char *diskfilename) {
 
     Allocator *alloc = NULL;
     buddy *memAlloc = NULL;
+    void *copyBuffer = NULL;
     if (memSize) {
         void *mem = mmap(NULL, memSize, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -17,6 +18,12 @@ Allocator *createAllocator(size_t memSize, size_t diskSize,
         if (mem == (void *)-1) {
             spdlog::error("Failed to mmap memory buffer: {}", strerror(errno));
             exit(1);
+        }
+
+        if (copyBufferSize < memSize) {
+            copyBuffer = mem;
+            mem = (uint8_t *)mem + copyBufferSize;
+            memSize -= copyBufferSize;
         }
 
         memAlloc = buddy_embed_alignment((uint8_t *)mem, memSize, 128);
@@ -62,6 +69,12 @@ Allocator *createAllocator(size_t memSize, size_t diskSize,
             exit(1);
         }
 
+        if (!copyBuffer && copyBufferSize < diskSize) {
+            copyBuffer = data;
+            data = (uint8_t *)data + copyBufferSize;
+            diskSize -= copyBufferSize;
+        }
+
         buddy *diskAlloc = buddy_embed((uint8_t *)data, diskSize);
 
         if (!diskAlloc) {
@@ -76,6 +89,10 @@ Allocator *createAllocator(size_t memSize, size_t diskSize,
         if (alloc) {
             alloc->diskAlloc = diskAlloc;
         }
+    }
+
+    if(alloc) {
+        alloc->copyBuffer = copyBuffer;
     }
 
     return alloc;
@@ -234,14 +251,18 @@ StringPartRef toStringPart(Allocator *alloc, StringPartRef currentTip,
                            const char *s1, size_t len1, const char *s2,
                            size_t len2) {
     if (!isNullRef(currentTip)) {
-        StringPart *prevPart = stringPartDeref(alloc, currentTip);
+        // StringPart *prevPart = stringPartDeref(alloc, currentTip);
         STRING_PART_RC_INC(alloc, currentTip);
     }
 
     StringPartRef cur =
         AllocatorAllocate(alloc, sizeof(StringPart) + len1 + len2);
 
-    StringPart *part = stringPartDeref(alloc, cur);
+    // stringPartDeref uses the size field found in the first few bytes to
+    // verify the rest of size of the rest of the string in ALLOC_DEBUG.
+    // However, we haven't set this size.
+    StringPart *part =
+        (StringPart *)allocDeref(alloc, cur, sizeof(StringPart) + len1 + len2);
     part->len = len1 + len2;
 
 #ifdef ALLOC_DEBUG

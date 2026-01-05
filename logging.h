@@ -11,12 +11,12 @@ template <> struct fmt::formatter<FileCopyJob> : fmt::formatter<std::string> {
             ctx.out(),
             "[FileCopyJob remote={}, partial={}, "
             "fileSize={}, blockSize={}, nScheduled={}, nFinished={}/{}]",
-            !isNullRef(my.remote)
-                ? stringrefImmediateToCString(globalAllocator, my.remote)
-                : "NULL",
-            !isNullRef(my.partial)
-                ? stringrefImmediateToCString(globalAllocator, my.partial)
-                : "NULL",
+            !isNullRef(my.remote) ? std::string(stringrefImmediateToCString(
+                                        globalAllocator, my.remote))
+                                  : "NULL",
+            !isNullRef(my.partial) ? std::string(stringrefImmediateToCString(
+                                         globalAllocator, my.partial))
+                                   : "NULL",
             my.stx.stx_size, my.blockSize, my.nBlockJobsScheduled,
             my.nBlockJobsFinished, blockCount(my.stx.stx_size, my.blockSize));
     }

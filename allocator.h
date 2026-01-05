@@ -48,6 +48,8 @@ struct Allocator {
 
     buddy *diskAlloc;
     buddy *memAlloc;
+
+    void *copyBuffer;
 };
 
 inline void *allocDeref(const Allocator *alloc, AllocRef ref,
@@ -97,7 +99,7 @@ inline bool isNullRef(AllocRef ref) {
 }
 
 Allocator *createAllocator(size_t memSize, size_t diskSize,
-                           const char *diskfilename);
+                           size_t copyBufferSize, const char *diskfilename);
 AllocRef AllocatorAllocate(Allocator *alloc, size_t len);
 AllocRef AllocatorAllocateRange(Allocator *alloc, size_t start, size_t len);
 void AllocatorFree(Allocator *alloc, AllocRef ref);
@@ -126,7 +128,7 @@ inline void stringPartRelease(Allocator *alloc, StringPartRef s) {
     StringPart *part;
     StringPartRef curRef = s;
     size_t i = 0;
-    while (!isNullRef(s) && (part = stringPartDeref(alloc, curRef))) {
+    while (!isNullRef(curRef) && (part = stringPartDeref(alloc, curRef))) {
         i++;
         size_t rc = part->rc--;
         if (!rc) {

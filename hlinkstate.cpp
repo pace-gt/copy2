@@ -3,6 +3,8 @@
 #include "filejob.h"
 #include "gtl/phmap.hpp"
 #include "logging.h"
+#include "sharedstate.h"
+#include "syscalls.h"
 #include <mutex>
 #include <omp.h>
 #include <pthread.h>
@@ -148,10 +150,11 @@ MDB_txn *getRDOnlyTxn(HLinkState *state) {
     return ret;
 }
 
-void hlinkStateRegisterLinkRoot(HLinkState *state, Allocator *alloc,
-                                const char *remote, StringPartRef remoteRef,
-                                uint64_t srcInode, uint64_t destInode,
-                                bool destExists, size_t srcNLinksExpected,
+void hlinkStateRegisterLinkRoot(SharedState *sharedState, HLinkState *state,
+                                Allocator *alloc, const char *remote,
+                                StringPartRef remoteRef, uint64_t srcInode,
+                                uint64_t destInode, bool destExists,
+                                size_t srcNLinksExpected,
                                 size_t destNLinksExpected, int destRootFD,
                                 bool *shouldTransfer, bool *isFirstLook,
                                 bool *isPendingHardlink) {
@@ -206,11 +209,12 @@ reroll:
                 spdlog::debug("root {} has already been transferred. "
                               "Hardlinking to {}",
                               linkRoot, remote);
-                if (unlinkat(destRootFD, remote, 0) < 0 && errno != ENOENT) {
+                if (unlinkat_wrapper(sharedState, destRootFD, remote, 0) < 0 &&
+                    errno != ENOENT) {
                     spdlog::error("Failed to unlink hardlink dest {}: {}",
                                   remote, strerror(errno));
-                } else if (linkat(destRootFD, linkRoot, destRootFD, remote, 0) <
-                           0) {
+                } else if (linkat_wrapper(sharedState, destRootFD, linkRoot,
+                                          destRootFD, remote, 0) < 0) {
                     spdlog::error("Failed to hardlink root {} to {}: {}",
                                   linkRoot, remote, strerror(errno));
                     exit(1);
@@ -425,7 +429,8 @@ void createHLinkState(HLinkState *state, const char *path,
     pthread_rwlock_init(&state->lock, 0);
 }
 
-void hlinkStateHandleTransfer(const FileCopyJob &fileJob, HLinkState *state,
+void hlinkStateHandleTransfer(SharedState *sharedState,
+                              const FileCopyJob &fileJob, HLinkState *state,
                               Allocator *alloc, const char *remote,
                               uint64_t srcInode, uint64_t destInode,
                               int srcRootFD, int destRootFD,
@@ -466,14 +471,16 @@ void hlinkStateHandleTransfer(const FileCopyJob &fileJob, HLinkState *state,
                           "pending link {} -> {}",
                           fileJob, remote, linkRoot);
 
-            if (unlinkat(destRootFD, linkRoot, 0) < 0 && errno != ENOENT) {
+            if (unlinkat_wrapper(sharedState, destRootFD, linkRoot, 0) < 0 &&
+                errno != ENOENT) {
                 spdlog::error("{} failed to unlink "
                               "{} to apply "
                               "pending: {}",
                               fileJob, linkRoot, strerror(errno));
             }
 
-            if (linkat(destRootFD, remote, destRootFD, linkRoot, 0) < 0) {
+            if (linkat_wrapper(sharedState, destRootFD, remote, destRootFD,
+                               linkRoot, 0) < 0) {
                 spdlog::error("{} failed to perform pending"
                               " link {} -> {} : {}",
                               fileJob, remote, linkRoot, strerror(errno));
