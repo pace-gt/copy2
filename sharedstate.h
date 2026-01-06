@@ -4,6 +4,27 @@
 #include <atomic>
 #include <semaphore.h>
 
+struct Opts {
+    std::string src, dest;
+
+    std::string dataDir = ".copy2";
+
+    size_t allocatorMemSize, allocatorDiskSize;
+
+    size_t nCrawlers, nTransfers, nFinishProcessors;
+
+    size_t copyBufferSize;
+    size_t minBlockSize, maxBlockSize;
+
+    size_t hlinkMemCacheMembers;
+    size_t hlinkDiskSize;
+    size_t maxFDs;
+
+#ifndef NDEBUG
+    bool runTests;
+#endif
+};
+
 struct SharedState {
     Queue jobQueue{0};
     Queue finishQueue{0};
@@ -36,4 +57,6 @@ struct SharedState {
 
     int destRootFD;
     int srcRootFD;
+
+    Opts opts;
 };

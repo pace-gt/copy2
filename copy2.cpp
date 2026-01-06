@@ -1,3 +1,5 @@
+#define CLI11_ENABLE_EXTRA_VALIDATORS 1
+#include "CLI/CLI.hpp"
 #include "allocator.h"
 #include "blockingconcurrentqueue.h"
 #include "bytesize.hh"
@@ -41,12 +43,7 @@
 #include <unistd.h>
 #include <utility>
 
-#define JOBS_PER_FILE 4
-#define BUF_SIZE (1024UL * 1024 * 128)
-#define QUEUE_SIZE 64
-
 #define MAX_FILES 30000
-size_t done = 0;
 
 #define INITIAL_READLINK_BUF_SIZE 512
 
@@ -640,6 +637,9 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
 
             sharedState->totalBytesSeen += stx.stx_size;
 
+            spdlog::info("blockSize({}, {}, {}, {})", stx.stx_size,
+                         stx.stx_blksize, sharedState->opts.minBlockSize,
+                         sharedState->opts.maxBlockSize);
             sharedState->jobQueue.enqueue({
                 .firstLook = isFirstLook,
                 .remote = STRING_PART_RC_INC(globalAllocator, path),
@@ -647,7 +647,9 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
                 .stx = stx,
                 .srcFd = srcFd,
                 .dstFd = dstFd,
-                .blockSize = blockSize(stx.stx_size),
+                .blockSize = blockSize(stx.stx_size, 64ULL * (1ULL << 20),
+                                       sharedState->opts.minBlockSize,
+                                       sharedState->opts.maxBlockSize),
             });
 
 #undef CLEAN
@@ -1331,6 +1333,10 @@ void incrementalLogger(SharedState *sharedState) {
             }
         }
 
+        if (done) {
+            done = sharedState->finishQueue.size_approx() == 0;
+        }
+
         if (done)
             break;
 
@@ -1399,12 +1405,79 @@ void incrementalLogger(SharedState *sharedState) {
 }
 
 int main(int argc, char *argv[]) {
+    auto cli = CLI::App("file transfer tool");
+    argv = cli.ensure_utf8(argv);
+
+#define MB (1ULL << 20)
+#define GB (1ULL << 30)
+#define TB (1ULL << 40)
+
+    Opts opts = {};
+    cli.add_option("--data-dir", opts.dataDir,
+                   "place to put files used by copy2 internally")
+        ->check(CLI::ExistingDirectory);
+    cli.add_option("--allocator-mem-size", opts.allocatorMemSize,
+                   "amount of RAM the allocator is given")
+        ->transform(CLI::AsSizeValue(false))
+        ->default_val("4GB");
+    cli.add_option("--allocator-disk-size", opts.allocatorDiskSize,
+                   "the size of the allocator's disk backed file")
+        ->transform(CLI::AsSizeValue(false))
+        ->default_val("1TB");
+    cli.add_option("--crawlers", opts.nCrawlers, "number of crawler threads")
+        ->default_val(16);
+    cli.add_option("--transfers", opts.nTransfers, "number of transfer threads")
+        ->default_val(8);
+    cli.add_option("--finish-processors", opts.nFinishProcessors,
+                   "number of finish processor threads")
+        ->default_val(16);
+    cli.add_option("--copy-buffer-size", opts.copyBufferSize,
+                   "size of staging buffer used to transfer files (from which "
+                   "staging buffers are allocated for individual files)")
+        ->transform(CLI::AsSizeValue(false))
+        ->default_val("2GB");
+    cli.add_option("--min-block-size", opts.minBlockSize,
+                   "minimum staging buffer size")
+        ->transform(CLI::AsSizeValue(false))
+        ->default_val("4KB");
+    cli.add_option("--max-block-size", opts.maxBlockSize,
+                   "maximum staging buffer size")
+        ->transform(CLI::AsSizeValue(false))
+        ->default_val("128MB");
+    cli.add_option(
+           "--hlink-cache-members", opts.hlinkMemCacheMembers,
+           "number of hardlink entries to store in ram before writing to disk")
+        ->default_val(100000);
+    cli.add_option("--hlink-disk-size", opts.hlinkDiskSize,
+                   "maximum hlink store disk size")
+        ->transform(CLI::AsSizeValue(false))
+        ->default_val("1TB");
+    cli.add_option("--max-FDs", opts.maxFDs,
+                   "maximum number of open file descriptors allowed")
+        ->default_val(60000);
+#ifndef NDEBUG
+    cli.add_option("--tests", opts.runTests, "should we run tests?")
+        ->default_val(false);
+#endif
+    cli.add_option("src", opts.src, "path to transfer files from")
+        ->required()
+        ->check(CLI::ExistingDirectory);
+    cli.add_option("dest", opts.dest, "path to transfer files to")
+        ->required()
+        ->check(CLI::ExistingDirectory);
+    cli.validate_positionals();
+
+    CLI11_PARSE(cli, argc, argv);
+
+    mkdir(opts.dataDir.c_str(), 0744);
+
     auto err_logger = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();
     err_logger->set_level(spdlog::level::info);
     // spdlog::cfg::load_env_levels();
 
-    auto file_sink =
-        std::make_shared<spdlog::sinks::basic_file_sink_mt>("copy2.log", true);
+    double starttime = omp_get_wtime();
+    auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
+        fmt::format("{}/copy2-{}.log", opts.dataDir, starttime), true);
     file_sink->set_level(spdlog::level::trace);
 
     auto logger = std::make_shared<spdlog::logger>(
@@ -1417,12 +1490,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    const char *root = argv[1];
-    const char *dest = argv[2];
+    const char *root = opts.src.c_str();
+    const char *dest = opts.dest.c_str();
 
     int destRootFD = open(dest, O_DIRECTORY | O_RDONLY | O_NOATIME);
     if (destRootFD < 0) {
-        spdlog::error("failed to open destination: {}", strerror(errno));
+        spdlog::error("failed to open destination {}: {}", dest,
+                      strerror(errno));
         return 1;
     }
 
@@ -1432,25 +1506,33 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    spdlog::info("copying files from {} to {}", argv[1], argv[2]);
-    double starttime = omp_get_wtime();
+    spdlog::info("copying files from {} to {}", opts.src, opts.dest);
 
-    size_t arena_size = 8ULL * (1ULL << 30);
-    globalAllocator = createAllocator(10ULL * 1ULL << 30, 1ULL << 40,
-                                      arena_size, "copy2.mem");
+    size_t arena_size = opts.copyBufferSize;
+    globalAllocator = createAllocator(
+        opts.allocatorMemSize, opts.allocatorDiskSize, arena_size,
+        fmt::format("{}/copy2-{}.mem", opts.dataDir, starttime).c_str());
     if (!globalAllocator) {
         spdlog::error("failed to create allocator");
         return 1;
     }
 
     SharedState *sharedState = new SharedState;
-    sharedState->jobQueue = Queue(30000);
-    sharedState->finishQueue = Queue{30000};
+    sharedState->opts = opts;
+
+    sharedState->jobQueue =
+        Queue(std::min((size_t)60000, sharedState->opts.maxFDs));
+    sharedState->finishQueue =
+        Queue(std::min((size_t)60000, sharedState->opts.maxFDs));
 
     // pthread_rwlock_init(&sharedState->hlinkState.lock, NULL);
-    createHLinkState(&sharedState->hlinkState, "hlstate.db", 1000000,
-                     1ULL << 30);
-    sem_init(&sharedState->fdSem, 0, MAX_FILES);
+    createHLinkState(
+        &sharedState->hlinkState,
+        fmt::format("{}/hlstate-{}.db", sharedState->opts.dataDir, starttime)
+            .c_str(),
+        sharedState->opts.hlinkMemCacheMembers,
+        sharedState->opts.hlinkDiskSize);
+    sem_init(&sharedState->fdSem, 0, opts.maxFDs);
 
     if (!globalAllocator->copyBuffer) {
         spdlog::error("failed to allocate copy buffer!");
@@ -1468,7 +1550,7 @@ int main(int argc, char *argv[]) {
     omp_set_nested(1);
     omp_set_max_active_levels(INT32_MAX);
 
-    const int nScheds = 8; // omp_get_max_threads();
+    const int nScheds = sharedState->opts.nTransfers; // omp_get_max_threads();
     CopyScheduler *scheds = new CopyScheduler[nScheds];
 
     for (size_t i = 0; i < nScheds; i++) {
@@ -1488,8 +1570,11 @@ int main(int argc, char *argv[]) {
         toStringPart(globalAllocator, {}, ".", 1, nullptr, 0);
 
 #ifndef NDEBUG
-    testProcessDir(sharedState);
-    testFinishQueue(sharedState);
+    testingSyscallBehaviorMatrix.s = {};
+    if (sharedState->opts.runTests) {
+        testProcessDir(sharedState);
+        testFinishQueue(sharedState);
+    }
 #endif
 
     int ret = 0;
@@ -1497,6 +1582,8 @@ int main(int argc, char *argv[]) {
     {
 #pragma omp section
         {
+// #pragma omp parallel num_threads(sharedState->opts.nCrawlers)
+// #pragma omp single
 #pragma omp taskgroup
             ret = processDir(STRING_PART_RC_INC(globalAllocator, rootRef),
                              std::nullopt, srcRootFD, destRootFD, sharedState);
@@ -1510,7 +1597,7 @@ int main(int argc, char *argv[]) {
 
 #pragma omp section
         {
-#pragma omp parallel num_threads(128)
+#pragma omp parallel num_threads(sharedState->opts.nFinishProcessors)
             {
                 finishProcessor(sharedState);
             }

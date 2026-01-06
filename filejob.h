@@ -6,9 +6,10 @@
 #include <libaio.h>
 #include <linux/stat.h>
 
-inline size_t blockSize(size_t fsize) {
-    return std::max(4096UL,
-                    std::min(32UL * (1 << 20), std::bit_ceil(fsize / 2)));
+inline size_t blockSize(size_t fsize, size_t fsBlockSize, size_t minBlockSize,
+                        size_t maxBlockSize) {
+    return std::max(minBlockSize,
+                    std::min(maxBlockSize, std::bit_ceil(fsBlockSize)));
 }
 
 inline size_t blockCount(size_t fsize, size_t blockSize) {
