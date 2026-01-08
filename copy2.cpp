@@ -637,9 +637,9 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
 
             sharedState->totalBytesSeen += stx.stx_size;
 
-            spdlog::info("blockSize({}, {}, {}, {})", stx.stx_size,
-                         stx.stx_blksize, sharedState->opts.minBlockSize,
-                         sharedState->opts.maxBlockSize);
+            // spdlog::info("blockSize({}, {}, {}, {})", stx.stx_size,
+            //              stx.stx_blksize, sharedState->opts.minBlockSize,
+            //              sharedState->opts.maxBlockSize);
             sharedState->jobQueue.enqueue({
                 .firstLook = isFirstLook,
                 .remote = STRING_PART_RC_INC(globalAllocator, path),

@@ -9,7 +9,7 @@
 inline size_t blockSize(size_t fsize, size_t fsBlockSize, size_t minBlockSize,
                         size_t maxBlockSize) {
     return std::max(minBlockSize,
-                    std::min(maxBlockSize, std::bit_ceil(fsBlockSize)));
+                    std::min(maxBlockSize, std::bit_ceil(fsize / 2)));
 }
 
 inline size_t blockCount(size_t fsize, size_t blockSize) {
