@@ -1,6 +1,6 @@
 #include "syscalls.h"
 
-#ifndef NDEUG
+#ifndef NDEBUG
 TestingSyscallBehaviorMatrix testingSyscallBehaviorMatrix;
 
 #else

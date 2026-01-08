@@ -21,7 +21,7 @@ struct HLinkInfo {
 template <typename T> struct HLinkCacheAllocator : std::allocator<T> {
     T *allocate(size_t n) {
         AllocRef ref = (AllocatorAllocate(
-            globalAllocator, sizeof(AllocRef) * n + sizeof(AllocRef)));
+            globalAllocator, sizeof(T) * n + sizeof(AllocRef)));
 
         AllocRef *ptr = (AllocRef *)allocDeref(
             globalAllocator, ref, (n) * sizeof(T) + sizeof(AllocRef));
@@ -31,7 +31,7 @@ template <typename T> struct HLinkCacheAllocator : std::allocator<T> {
         return (T *)(ptr + 1);
     }
 
-    void free(T *ptr) {
+    void deallocate(T *ptr, size_t) {
         if (ptr)
             AllocatorFree(globalAllocator, *((AllocRef *)ptr - 1));
     }

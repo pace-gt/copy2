@@ -177,11 +177,11 @@ inline LinkEntryRef linkEntryAppend(Allocator *alloc, LinkEntryRef tip,
                                     LinkEntryRef next) {
     assert(!isNullRef(next));
     if (isNullRef(tip)) {
-        ((LinkEntry *)allocDeref(alloc, next, sizeof(LinkEntryRef)))->prev = {};
+        ((LinkEntry *)allocDeref(alloc, next, sizeof(LinkEntry)))->prev = {};
         return next;
     }
 
-    ((LinkEntry *)allocDeref(alloc, next, sizeof(LinkEntryRef)))->prev = tip;
+    ((LinkEntry *)allocDeref(alloc, next, sizeof(LinkEntry)))->prev = tip;
 
     return next;
 }

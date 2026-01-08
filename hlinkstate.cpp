@@ -348,7 +348,6 @@ reroll_dststate:
 
             if (readPair(state->wrTxn, state->env, state->revTableCache,
                          state->revTable, destInode, &revinfoRef)) {
-                revinfo->lock.lock();
                 deletePair(state, state->wrTxn, state->env, state->revTable,
                            state->revTableCache, destInode);
                 AllocatorFree(alloc, revinfoRef);

@@ -65,7 +65,7 @@ static_assert(sizeof(TestingSyscallBehaviorMatrix::s) /
     }
 
 #else
-#define TESTING_ASSTESTING_ASSERT_SYSCALL_BEHAVIOR(name, failval)
+#define TESTING_ASSERT_SYSCALL_BEHAVIOR(name, failval)
 #endif
 
 // ensure that the path does not contain any ".." components
@@ -222,8 +222,6 @@ inline DIR *fdopendir_wrapper(SharedState *sharedState, int fd) {
     TESTING_ASSERT_SYSCALL_BEHAVIOR(fdopendir, NULL);
     assert(sharedState->destRootFD != fd);
     assert(sharedState->srcRootFD != fd);
-
-    sem_wait(&sharedState->fdSem);
 
     DIR *dir = fdopendir(fd);
     if (!dir) {
