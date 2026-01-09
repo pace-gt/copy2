@@ -20,6 +20,8 @@ struct Opts {
     size_t hlinkDiskSize;
     size_t maxFDs;
 
+    bool readback;
+
 #ifndef NDEBUG
     bool runTests;
 #endif
@@ -36,12 +38,15 @@ struct SharedState {
     std::atomic_size_t filesSeen;
     std::atomic_size_t totalBytesTransferred; // actually transferred + existing
     std::atomic_size_t totalBytesActuallyTransferred;
+    std::atomic_size_t totalBytesSeenAndWillTransfer;
     std::atomic_size_t totalBytesSeen;
     std::atomic_size_t bytesRead;
     std::atomic_size_t bytesWritten;
 
     std::atomic_size_t allocationAttempts;
     std::atomic_size_t allocationFailures;
+
+    std::atomic_size_t nFinishProcessorsDone;
 
     std::atomic_size_t totalMemAllocated = 0;
 

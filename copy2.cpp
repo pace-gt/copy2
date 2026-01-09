@@ -293,10 +293,12 @@ inline void schedulerUpdateBlockCopyJob(CopyScheduler *sched,
             blockJob->type = WRITE;
             io_set_callback(&blockJob->cb, wr_done);
 
-            // blockJob->srcHash = XXH3_64bits(blockJob->data,
-            // blockJob->nbytes);
             blockJob->srcHash = 0;
-            spdlog::trace("{} hash is {:x}", *blockJob, blockJob->srcHash);
+            if (sharedState->opts.readback) {
+                blockJob->srcHash =
+                    XXH3_64bits(blockJob->data, blockJob->nbytes);
+                spdlog::trace("{} hash is {:x}", *blockJob, blockJob->srcHash);
+            }
 
             spdlog::trace("{} submitting write request corresponding "
                           "to finished read request",
@@ -308,30 +310,38 @@ inline void schedulerUpdateBlockCopyJob(CopyScheduler *sched,
 
             sharedState->bytesWritten += blockJob->nbytes;
 
-            memset(blockJob->data, 0, blockJob->nbytes);
-            io_prep_pread(&blockJob->cb, blockJob->parent->dstFd,
-                          blockJob->data, blockJob->nbytes, blockJob->offset);
-            // iocb *cbp = &blockJob->cb;
-            blockJob->status = EINPROGRESS;
-            blockJob->type = READDST;
-            io_set_callback(&blockJob->cb, rd_done);
+            if (sharedState->opts.readback) {
+                memset(blockJob->data, 0, blockJob->nbytes);
+                io_prep_pread(&blockJob->cb, blockJob->parent->dstFd,
+                              blockJob->data, blockJob->nbytes,
+                              blockJob->offset);
+                // iocb *cbp = &blockJob->cb;
+                blockJob->status = EINPROGRESS;
+                blockJob->type = READDST;
+                io_set_callback(&blockJob->cb, rd_done);
 
-            spdlog::trace(
-                "{} submitting destination readback request corresponding "
-                "to finished write request",
-                *blockJob);
+                spdlog::trace(
+                    "{} submitting destination readback request corresponding "
+                    "to finished write request",
+                    *blockJob);
 
-            schedIOSubmitDeferred(sched, &blockJob->cb);
+                schedIOSubmitDeferred(sched, &blockJob->cb);
+            } else {
+                blockJob->type = FINISH;
+                blockJob->status = 0;
+            }
         } else {
-            spdlog::trace("{} readdst request finished", *blockJob);
+            if (blockJob->type == READDST) {
+                spdlog::trace("{} readdst request finished", *blockJob);
 
-            // auto dstHash = XXH3_64bits(blockJob->data, blockJob->nbytes);
-            XXH64_hash_t dstHash = 0;
-            spdlog::trace("{} dst hash is {:x}", *blockJob, dstHash);
-            if (dstHash != blockJob->srcHash) {
-                spdlog::error("{} src vs dst hash mismatch {:x} vs {:x}",
-                              *blockJob, blockJob->srcHash, dstHash, dstHash);
-                fileJob->nErrors++;
+                auto dstHash = XXH3_64bits(blockJob->data, blockJob->nbytes);
+                spdlog::trace("{} dst hash is {:x}", *blockJob, dstHash);
+                if (dstHash != blockJob->srcHash) {
+                    spdlog::error("{} src vs dst hash mismatch {:x} vs {:x}",
+                                  *blockJob, blockJob->srcHash, dstHash,
+                                  dstHash);
+                    fileJob->nErrors++;
+                }
             }
 
             fileJob->nBlockJobsScheduled--;
@@ -480,7 +490,7 @@ int schedulerUpdate(CopyScheduler *sched, SharedState *sharedState,
     for (size_t i = 0; i < sched->nFileCopyJobs; i++) {
         FileCopyJob newJob;
         if (!sched->fileCopyJobs[i].active) {
-            if (jobQueue.wait_dequeue_timed(newJob, 100000)) {
+            if (jobQueue.wait_dequeue_timed(newJob, 1000)) {
                 sched->fileCopyJobs[i] = newJob;
                 sched->fileCopyJobs[i].nBlockJobsScheduled = 0;
                 sched->fileCopyJobs[i].nBlockJobsFinished = 0;
@@ -600,6 +610,10 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
         isFirstLook = true;
     }
 
+    if (S_ISREG(stx.stx_mode)) {
+        sharedState->totalBytesSeen += stx.stx_size;
+    }
+
     if (shouldTransfer) {
         unlinkat_wrapper(sharedState, destRootFD, partial, 0);
 
@@ -635,7 +649,7 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
                 return 1;
             }
 
-            sharedState->totalBytesSeen += stx.stx_size;
+            sharedState->totalBytesSeenAndWillTransfer += stx.stx_size;
 
             // spdlog::info("blockSize({}, {}, {}, {})", stx.stx_size,
             //              stx.stx_blksize, sharedState->opts.minBlockSize,
@@ -918,13 +932,15 @@ void finishProcessor(SharedState *sharedState) {
         }
 
         FileCopyJob fileJob;
-        while (sharedState->finishQueue.wait_dequeue_timed(fileJob, 100000)) {
+        while (sharedState->finishQueue.wait_dequeue_timed(fileJob, 1000)) {
             finishProcessorOne(sharedState, fileJob);
         }
 
         if (done)
             break;
     }
+
+    sharedState->nFinishProcessorsDone++;
 }
 
 #ifndef NDEBUG
@@ -1324,27 +1340,15 @@ void testFinishQueue(SharedState *sharedState) {
 
 void incrementalLogger(SharedState *sharedState) {
     double lastPrint = omp_get_wtime();
-    bool quit = false;
     while (true) {
-        bool done = true;
-        for (size_t i = 0; i < sharedState->nscheds; i++) {
-            if (!sharedState->scheds[i].done) {
-                done = false;
-            }
-        }
-
-        if (done) {
-            done = sharedState->finishQueue.size_approx() == 0;
-        }
-
-        if (done)
-            break;
+        bool done = sharedState->nFinishProcessorsDone ==
+                    sharedState->opts.nFinishProcessors;
 
         double now = omp_get_wtime();
         double delta = now - lastPrint;
-        if (delta > 3.0 || (quit && (size_t)(delta * 1000) > 1.0)) {
+        if (delta > 3.0 || done) {
             spdlog::info(
-                "transferred {}/{} files, {}({})/{} (read {}/s, "
+                "transferred {}/{} files, {}({})/{}({}) (read {}/s, "
                 "write {}/s)",
                 sharedState->nFinished.load(), sharedState->filesSeen.load(),
                 bytesize::bytesize{sharedState->totalBytesTransferred.load()},
@@ -1352,9 +1356,17 @@ void incrementalLogger(SharedState *sharedState) {
                     sharedState->totalBytesActuallyTransferred.load()},
                 bytesize::bytesize{sharedState->totalBytesSeen.load()},
                 bytesize::bytesize{
-                    (size_t)((double)sharedState->bytesRead.load() / delta)},
-                bytesize::bytesize{(
-                    size_t)((double)sharedState->bytesWritten.load() / delta)});
+                    sharedState->totalBytesSeenAndWillTransfer.load()},
+                bytesize::bytesize{
+                    delta < 0.5
+                        ? 0
+                        : (size_t)((double)sharedState->bytesRead.load() /
+                                   delta)},
+                bytesize::bytesize{
+                    delta < 0.5
+                        ? 0
+                        : (size_t)((double)sharedState->bytesWritten.load() /
+                                   delta)});
 
             spdlog::info("\tallocation failures {}/{}",
                          sharedState->allocationFailures.load(),
@@ -1397,8 +1409,7 @@ void incrementalLogger(SharedState *sharedState) {
             lastPrint = omp_get_wtime();
         }
 
-        if (quit) {
-            spdlog::info("done: {}", delta);
+        if (done) {
             break;
         }
     }
@@ -1444,6 +1455,9 @@ int main(int argc, char *argv[]) {
                    "maximum staging buffer size")
         ->transform(CLI::AsSizeValue(false))
         ->default_val("128MB");
+    cli.add_option("--readback", opts.readback,
+                   "should we read transferred blocks back and run checksums?")
+        ->default_val(false);
     cli.add_option(
            "--hlink-cache-members", opts.hlinkMemCacheMembers,
            "number of hardlink entries to store in ram before writing to disk")
@@ -1582,8 +1596,8 @@ int main(int argc, char *argv[]) {
     {
 #pragma omp section
         {
-// #pragma omp parallel num_threads(sharedState->opts.nCrawlers)
-// #pragma omp single
+#pragma omp parallel num_threads(sharedState->opts.nCrawlers)
+#pragma omp single
 #pragma omp taskgroup
             ret = processDir(STRING_PART_RC_INC(globalAllocator, rootRef),
                              std::nullopt, srcRootFD, destRootFD, sharedState);

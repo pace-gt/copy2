@@ -37,12 +37,12 @@ namespace bytesize {
 		std::string format() const {
 			std::ostringstream oss;
 			oss<<std::setprecision(3);
-			if(bytes<1'000LL) oss<<bytes<<" B";
-			else if(bytes<1'000'000LL) oss<<(bytes*1./1000LL)<<" kB";
-			else if(bytes<1'000'000'000LL) oss<<(bytes*1./1000'000LL)<<" MB";
-			else if(bytes<1'000'000'000'000LL) oss<<(bytes*1./1000'000'000LL)<<" GB";
-			else if(bytes<1'000'000'000'000'000LL) oss<<(bytes*1./1000'000'000'000LL)<<" TB";
-			else oss<<(bytes*1./1000'000'000'000'000LL)<<" PB";
+			if(bytes<(1LL<<10)) oss<<bytes<<" B";
+			else if(bytes<(1LL<<20)) oss<<(bytes*1./(1LL<<10))<<" KiB";
+			else if(bytes<(1LL<<30)) oss<<(bytes*1./(1LL<<20))<<" MiB";
+			else if(bytes<(1LL<<40)) oss<<(bytes*1./(1LL<<30))<<" GiB";
+			else if(bytes<(1LL<<50)) oss<<(bytes*1./(1LL<<40))<<" TiB";
+			else oss<<(bytes*1./(1LL<<50))<<" PiB";
 			return oss.str();
 		}
 		// implicit conversion to size_t

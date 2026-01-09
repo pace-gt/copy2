@@ -42,9 +42,10 @@ enum RW {
     READ = 0,
     WRITE = 1,
     READDST = 2,
+    FINISH = 3,
 };
 
-static const char *rwStrings[] = {"READ", "WRITE", "READDST"};
+static const char *rwStrings[] = {"READ", "WRITE", "READDST", "FINISH"};
 
 struct BlockCopyJob {
     int jobno; // ID within parent
