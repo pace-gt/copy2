@@ -5,7 +5,8 @@
 
 Allocator *globalAllocator = NULL;
 
-Allocator *createAllocator(size_t memSize, size_t diskSize,
+Allocator *createAllocator(size_t memSize, size_t nSubAllocators,
+                           size_t subAllocatorSize, size_t diskSize,
                            size_t copyBufferSize, const char *diskfilename) {
 
     Allocator *alloc = NULL;
@@ -33,11 +34,32 @@ Allocator *createAllocator(size_t memSize, size_t diskSize,
             exit(1);
         }
 
+        for (size_t i = 0; i < nSubAllocators; i++) {
+            void *ptr = buddy_calloc(memAlloc, 1, subAllocatorSize);
+            if (!ptr) {
+                spdlog::error("Failed to allocate suballocator!");
+                exit(1);
+            }
+
+            buddy *suballoc = buddy_embed_alignment((unsigned char *)ptr,
+                                                    subAllocatorSize, 128);
+            if (!suballoc) {
+                spdlog::error("Failed to embed suballocator!");
+                exit(1);
+            }
+        }
+
         alloc = (Allocator *)buddy_calloc(memAlloc, 1, sizeof(Allocator));
 
         if (alloc) {
             alloc->memAlloc = memAlloc;
         }
+
+        alloc->memBase = (unsigned char *)mem;
+        alloc->nSubAllocators = nSubAllocators;
+        alloc->subAllocatorSize = subAllocatorSize;
+        alloc->subAllocatorLocks = (spinlock *)buddy_calloc(
+            memAlloc, nSubAllocators, sizeof(spinlock));
     }
 
     if (diskSize) {
@@ -105,9 +127,20 @@ AllocRef AllocatorAllocate(Allocator *alloc, size_t len) {
     assert(len);
     assert(alloc);
 
-    alloc->lock.lock();
-
     void *allocation = NULL;
+
+    if (alloc->nSubAllocators) {
+        size_t allocNum = gettid() % alloc->nSubAllocators;
+        // spdlog::info("allocNum: {}", allocNum);
+        alloc->subAllocatorLocks[allocNum].lock();
+        buddy *suballoc =
+            buddy_get_embed_at_alignment((unsigned char *)alloc->memBase +
+                                             allocNum * alloc->subAllocatorSize,
+                                         alloc->subAllocatorSize, 128);
+        assert(suballoc);
+        allocation = buddy_calloc(suballoc, 1, len);
+        alloc->subAllocatorLocks[allocNum].unlock();
+    }
 
 #ifdef ALLOC_DEBUG
     AllocDebug dbg = {
@@ -118,12 +151,18 @@ AllocRef AllocatorAllocate(Allocator *alloc, size_t len) {
     len += sizeof(AllocDebug);
 #endif
 
-    if (alloc->memAlloc) {
-        allocation = buddy_calloc(alloc->memAlloc, 1, len);
-    }
+    if (!allocation) {
+        alloc->lock.lock();
 
-    if (!allocation && alloc->diskAlloc) {
-        allocation = buddy_calloc(alloc->diskAlloc, 1, len);
+        if (alloc->memAlloc) {
+            allocation = buddy_calloc(alloc->memAlloc, 1, len);
+        }
+
+        if (!allocation && alloc->diskAlloc) {
+            allocation = buddy_calloc(alloc->diskAlloc, 1, len);
+        }
+
+        alloc->lock.unlock();
     }
 
 #ifdef ALLOC_DEBUG
@@ -131,8 +170,6 @@ AllocRef AllocatorAllocate(Allocator *alloc, size_t len) {
         *(AllocDebug *)((uint8_t *)allocation + len - sizeof(AllocDebug)) = dbg;
     }
 #endif
-
-    alloc->lock.unlock();
 
     assert(allocation);
     return {
@@ -201,9 +238,38 @@ AllocRef AllocatorAllocateRange(Allocator *alloc, size_t offset, size_t len) {
 }
 
 void AllocatorFree(Allocator *alloc, AllocRef ref) {
-    alloc->lock.lock();
     void *ptr = allocDeref(alloc, ref);
+    // free(ptr);
+    // return;
 
+    if (alloc->nSubAllocators && ptr >= alloc->memBase) {
+        size_t allocIndex =
+            ((unsigned char *)ptr - alloc->memBase) / alloc->subAllocatorSize;
+
+        if (allocIndex < alloc->nSubAllocators) {
+            alloc->subAllocatorLocks[allocIndex].lock();
+            buddy *suballoc = buddy_get_embed_at_alignment(
+                (unsigned char *)alloc->memBase, alloc->subAllocatorSize, 128);
+
+#ifdef ALLOC_DEBUG
+            buddy_safe_free_status status = buddy_safe_free(
+                suballoc, ptr, ref.dbg.size = sizeof(AllocDebug));
+            assert(status != BUDDY_SAFE_FREE_ALREADY_FREE);
+            assert(status != BUDDY_SAFE_FREE_INVALID_ADDRESS);
+            assert(status != BUDDY_SAFE_FREE_SIZE_MISMATCH);
+            assert(status != BUDDY_SAFE_FREE_BUDDY_IS_NULL);
+            assert(status == BUDDY_SAFE_FREE_SUCCESS);
+#else
+            buddy_free(suballoc, ptr);
+#endif
+
+            alloc->subAllocatorLocks[allocIndex].unlock();
+
+            return;
+        }
+    }
+
+    alloc->lock.lock();
 #ifdef ALLOC_DEBUG
     buddy_safe_free_status status = buddy_safe_free(
         alloc->memAlloc, ptr, ref.dbg.size + sizeof(AllocDebug));
@@ -257,13 +323,13 @@ StringPartRef toStringPart(Allocator *alloc, StringPartRef currentTip,
     }
 
     StringPartRef cur =
-        AllocatorAllocate(alloc, sizeof(StringPart) + len1 + len2);
+        AllocatorAllocate(alloc, sizeof(StringPart) + len1 + len2 + 1);
 
     // stringPartDeref uses the size field found in the first few bytes to
     // verify the rest of size of the rest of the string in ALLOC_DEBUG.
     // However, we haven't set this size.
     StringPart *part =
-        (StringPart *)allocDeref(alloc, cur, sizeof(StringPart) + len1 + len2);
+        (StringPart *)allocDeref(alloc, cur, sizeof(StringPart) + len1 + len2 + 1);
     part->len = len1 + len2;
 
 #ifdef ALLOC_DEBUG

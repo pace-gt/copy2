@@ -48,12 +48,18 @@ struct Allocator {
 
     buddy *diskAlloc;
     buddy *memAlloc;
+    unsigned char* memBase;
 
     void *copyBuffer;
+
+    size_t nSubAllocators;
+    size_t subAllocatorSize;
+    spinlock* subAllocatorLocks;
 };
 
 inline void *allocDeref(const Allocator *alloc, AllocRef ref,
                         size_t expectedSize = 0) {
+    // return ref.ptr;
 #ifdef ALLOC_DEBUG
     // assert that the allocation ref thinks it's allocated
     assert(ref.ptr);
@@ -98,7 +104,8 @@ inline bool isNullRef(AllocRef ref) {
     return !ref.ptr;
 }
 
-Allocator *createAllocator(size_t memSize, size_t diskSize,
+Allocator *createAllocator(size_t memSize, size_t nSubAllocators,
+                           size_t subAllocatorSize, size_t diskSize,
                            size_t copyBufferSize, const char *diskfilename);
 AllocRef AllocatorAllocate(Allocator *alloc, size_t len);
 AllocRef AllocatorAllocateRange(Allocator *alloc, size_t start, size_t len);
@@ -115,7 +122,7 @@ struct StringPart {
 
 inline StringPart *stringPartDeref(const Allocator *alloc, StringPartRef ref) {
     StringPart *ptr = (StringPart *)allocDeref(alloc, ref);
-    ptr = (StringPart *)allocDeref(alloc, ref, ptr->len + sizeof(StringPart));
+    ptr = (StringPart *)allocDeref(alloc, ref, 1 + ptr->len + sizeof(StringPart));
 
     return ptr;
 }

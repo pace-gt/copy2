@@ -10,6 +10,7 @@ struct Opts {
     std::string dataDir = ".copy2";
 
     size_t allocatorMemSize, allocatorDiskSize;
+    size_t threadMemSize;
 
     size_t nCrawlers, nTransfers, nFinishProcessors;
 
@@ -51,6 +52,9 @@ struct SharedState {
     std::atomic_size_t totalMemAllocated = 0;
 
     std::atomic_size_t schedulerIterations;
+
+    std::atomic_size_t statms;
+    std::atomic_size_t ndirs;
 
     std::atomic<int> crawlDone;
 

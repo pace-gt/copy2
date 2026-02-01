@@ -245,7 +245,7 @@ reroll:
             } else {
                 spdlog::debug("{} has not been transferred. Queueing "
                               "hardlinkage to {}",
-                              linkRoot, remote);
+                              remote, linkRoot);
                 LinkEntryRef entryRef =
                     AllocatorAllocate(alloc, sizeof(LinkEntry));
 

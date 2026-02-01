@@ -1,3 +1,5 @@
+#include <chrono>
+#include <thread>
 #define CLI11_ENABLE_EXTRA_VALIDATORS 1
 #include "CLI/CLI.hpp"
 #include "allocator.h"
@@ -490,7 +492,7 @@ int schedulerUpdate(CopyScheduler *sched, SharedState *sharedState,
     for (size_t i = 0; i < sched->nFileCopyJobs; i++) {
         FileCopyJob newJob;
         if (!sched->fileCopyJobs[i].active) {
-            if (jobQueue.wait_dequeue_timed(newJob, 1000)) {
+            if (jobQueue.wait_dequeue_timed(newJob, 100000)) {
                 sched->fileCopyJobs[i] = newJob;
                 sched->fileCopyJobs[i].nBlockJobsScheduled = 0;
                 sched->fileCopyJobs[i].nBlockJobsFinished = 0;
@@ -770,19 +772,22 @@ int processDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
 
     sharedState->filesSeen++;
 
+    sharedState->ndirs++;
+
     struct dirent *d;
     while ((d = readdir_wrapper(sharedState, dir))) {
         if (ISDOT(d->d_name)) {
             continue;
         }
 
-        StringPartRef newPathRef = toStringPart(globalAllocator, path, "/", 1,
-                                                d->d_name, strlen(d->d_name));
-
         if (d->d_type == DT_DIR) {
+            StringPartRef newPathRef = toStringPart(
+                globalAllocator, path, "/", 1, d->d_name, strlen(d->d_name));
 #pragma omp task
             processDir(newPathRef, dev, srcRootFD, destRootFD, sharedState);
         } else {
+            StringPartRef newPathRef = toStringPart(
+                globalAllocator, path, "/", 1, d->d_name, strlen(d->d_name));
 #pragma omp task
             processNonDir(newPathRef, dev, srcRootFD, destRootFD, sharedState);
         }
@@ -932,7 +937,7 @@ void finishProcessor(SharedState *sharedState) {
         }
 
         FileCopyJob fileJob;
-        while (sharedState->finishQueue.wait_dequeue_timed(fileJob, 1000)) {
+        while (sharedState->finishQueue.wait_dequeue_timed(fileJob, 100000)) {
             finishProcessorOne(sharedState, fileJob);
         }
 
@@ -978,7 +983,7 @@ void testProcessDir(SharedState *sharedState) {
         toStringPart(globalAllocator, {}, dirname, strlen(dirname), "", 0),
         std::nullopt, sharedState->srcRootFD, sharedState->destRootFD,
         sharedState));
-    assert(!sharedState->finishQueue.wait_dequeue_timed(job, 10000));
+    assert(!sharedState->finishQueue.wait_dequeue_timed(job, 100000));
 
     // openat
     TESTING_PROCESS_DIR_PREAMBLE;
@@ -1368,6 +1373,13 @@ void incrementalLogger(SharedState *sharedState) {
                         : (size_t)((double)sharedState->bytesWritten.load() /
                                    delta)});
 
+            spdlog::info("\tjobqueue: size={}, enqueuesem={}",
+                         sharedState->jobQueue.size_approx(),
+                         sharedState->jobQueue.enqueueSem->get_value());
+            spdlog::info("\tfinishQueue: size={}, enqueuesem={}",
+                         sharedState->finishQueue.size_approx(),
+                         sharedState->finishQueue.enqueueSem->get_value());
+
             spdlog::info("\tallocation failures {}/{}",
                          sharedState->allocationFailures.load(),
                          sharedState->allocationAttempts.load());
@@ -1377,6 +1389,11 @@ void incrementalLogger(SharedState *sharedState) {
                          sharedState->totalMemAllocated.load() / 1024);
             spdlog::info("\tscheduler iterations {}",
                          sharedState->schedulerIterations.load());
+            int val;
+            sem_getvalue(&sharedState->fdSem, &val);
+            spdlog::info("\tfdsem: {}", val);
+            spdlog::info("\tndirs: {}", sharedState->ndirs.load());
+            spdlog::info("\tstat time: {}ms", sharedState->statms.load());
 
             // for (int i = 0; i < nScheds; i++) {
             //     size_t nFActive = 0;
@@ -1406,8 +1423,12 @@ void incrementalLogger(SharedState *sharedState) {
             sharedState->allocationAttempts = 0;
             sharedState->allocationFailures = 0;
             sharedState->schedulerIterations = 0;
+            sharedState->ndirs = 0;
+            sharedState->statms = 0;
             lastPrint = omp_get_wtime();
         }
+
+        std::this_thread::sleep_for(std::chrono::seconds(1));
 
         if (done) {
             break;
@@ -1455,6 +1476,9 @@ int main(int argc, char *argv[]) {
                    "maximum staging buffer size")
         ->transform(CLI::AsSizeValue(false))
         ->default_val("128MB");
+    cli.add_option("--mem-per-thread", opts.threadMemSize, "Memory per thread")
+        ->transform(CLI::AsSizeValue(false))
+        ->default_val("256KB");
     cli.add_option("--readback", opts.readback,
                    "should we read transferred blocks back and run checksums?")
         ->default_val(false);
@@ -1524,7 +1548,9 @@ int main(int argc, char *argv[]) {
 
     size_t arena_size = opts.copyBufferSize;
     globalAllocator = createAllocator(
-        opts.allocatorMemSize, opts.allocatorDiskSize, arena_size,
+        opts.allocatorMemSize,
+        opts.nFinishProcessors + opts.nCrawlers + opts.nTransfers,
+        opts.threadMemSize, opts.allocatorDiskSize, arena_size,
         fmt::format("{}/copy2-{}.mem", opts.dataDir, starttime).c_str());
     if (!globalAllocator) {
         spdlog::error("failed to create allocator");

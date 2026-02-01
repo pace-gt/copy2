@@ -254,6 +254,12 @@ public:
 			while (sem_post(&m_sema) == -1);
 		}
 	}
+
+    int get_value() {
+        int val = -1;
+        sem_getvalue(&m_sema, &val);
+        return val;
+    }
 };
 #else
 #error Unsupported platform! (No semaphore wrapper available)

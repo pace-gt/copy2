@@ -1,10 +1,12 @@
 #pragma once
 
+#include "allocator.h"
 #include "sharedstate.h"
 #include <assert.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <linux/stat.h>
+#include <omp.h>
 #include <semaphore.h>
 #include <span>
 #include <string.h>
@@ -239,7 +241,11 @@ inline int statx_wrapper(SharedState *sharedState, int dirfd, const char *path,
     assert(mask);
     assert(dirfd == sharedState->destRootFD || sharedState->srcRootFD);
 
-    return statx(dirfd, path, flags, mask, statxbuf);
+    double time = omp_get_wtime();
+    int ret = statx(dirfd, path, flags, mask, statxbuf);
+    sharedState->statms += (omp_get_wtime() - time) * 1000;
+
+    return ret;
 }
 
 inline int linkat_wrapper(SharedState *sharedState, int olddirfd,
@@ -288,3 +294,28 @@ inline dirent *readdir_wrapper(SharedState *sharedState, DIR *dir) {
 
     return readdir(dir);
 }
+
+struct FDRef {
+    int fd;
+    std::atomic_size_t rc;
+};
+
+struct FDRefGuard {
+    AllocRef fdref;
+    SharedState* sharedState;
+
+    int getFD() {
+        FDRef *ref = (FDRef *)allocDeref(globalAllocator, fdref, sizeof(FDRef));
+        return ref->fd;
+    }
+
+    ~FDRefGuard() {
+        FDRef *ref = (FDRef *)allocDeref(globalAllocator, fdref, sizeof(FDRef));
+
+        size_t rc = ref->rc--;
+
+        if (rc == 1) {
+            close_wrapper(sharedState, ref->fd);
+        }
+    }
+};
