@@ -2,6 +2,7 @@
 #include "hlinkstate.h"
 #include "queue.h"
 #include <atomic>
+#include <memory>
 #include <semaphore.h>
 
 struct Opts {
@@ -68,4 +69,6 @@ struct SharedState {
     int srcRootFD;
 
     Opts opts;
+
+    std::shared_ptr<spdlog::logger> logger;
 };

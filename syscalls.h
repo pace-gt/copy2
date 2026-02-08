@@ -269,7 +269,7 @@ inline int unlinkat_wrapper(SharedState *sharedState, int dirfd,
                             const char *path, int flags) {
     TESTING_ASSERT_SYSCALL_BEHAVIOR(unlinkat, -1);
     assert(path_ok(path));
-    assert(flags == 0);
+    assert(flags == 0 || flags == AT_REMOVEDIR);
     assert(path);
     assert(dirfd >= 0);
     assert(sharedState->destRootFD == dirfd);

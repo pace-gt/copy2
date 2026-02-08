@@ -1,3 +1,4 @@
+#include "spdlog/spdlog.h"
 #include <ranges>
 #define BUDDY_ALLOC_IMPLEMENTATION
 #include "allocator.h"
@@ -8,6 +9,7 @@ Allocator *globalAllocator = NULL;
 Allocator *createAllocator(size_t memSize, size_t nSubAllocators,
                            size_t subAllocatorSize, size_t diskSize,
                            size_t copyBufferSize, const char *diskfilename) {
+    spdlog::info("logger is {}", (void*)spdlog::default_logger_raw());
 
     Allocator *alloc = NULL;
     buddy *memAlloc = NULL;
@@ -121,8 +123,8 @@ Allocator *createAllocator(size_t memSize, size_t nSubAllocators,
 }
 
 AllocRef AllocatorAllocate(Allocator *alloc, size_t len) {
-    // void *val = calloc(len, 1);
-    // return *(AllocRef *)&val;
+    void *val = calloc(len, 1);
+    return *(AllocRef *)&val;
 
     assert(len);
     assert(alloc);
@@ -239,8 +241,8 @@ AllocRef AllocatorAllocateRange(Allocator *alloc, size_t offset, size_t len) {
 
 void AllocatorFree(Allocator *alloc, AllocRef ref) {
     void *ptr = allocDeref(alloc, ref);
-    // free(ptr);
-    // return;
+    free(ptr);
+    return;
 
     if (alloc->nSubAllocators && ptr >= alloc->memBase) {
         size_t allocIndex =
@@ -253,7 +255,7 @@ void AllocatorFree(Allocator *alloc, AllocRef ref) {
 
 #ifdef ALLOC_DEBUG
             buddy_safe_free_status status = buddy_safe_free(
-                suballoc, ptr, ref.dbg.size = sizeof(AllocDebug));
+                suballoc, ptr, ref.dbg.size + sizeof(AllocDebug));
             assert(status != BUDDY_SAFE_FREE_ALREADY_FREE);
             assert(status != BUDDY_SAFE_FREE_INVALID_ADDRESS);
             assert(status != BUDDY_SAFE_FREE_SIZE_MISMATCH);
@@ -328,8 +330,8 @@ StringPartRef toStringPart(Allocator *alloc, StringPartRef currentTip,
     // stringPartDeref uses the size field found in the first few bytes to
     // verify the rest of size of the rest of the string in ALLOC_DEBUG.
     // However, we haven't set this size.
-    StringPart *part =
-        (StringPart *)allocDeref(alloc, cur, sizeof(StringPart) + len1 + len2 + 1);
+    StringPart *part = (StringPart *)allocDeref(
+        alloc, cur, sizeof(StringPart) + len1 + len2 + 1);
     part->len = len1 + len2;
 
 #ifdef ALLOC_DEBUG

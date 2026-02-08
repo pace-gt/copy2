@@ -45,8 +45,6 @@
 #include <unistd.h>
 #include <utility>
 
-#define MAX_FILES 30000
-
 #define INITIAL_READLINK_BUF_SIZE 512
 
 #define ISDOT(a) (a[0] == '.' && (!a[1] || (a[1] == '.' && !a[2])))
@@ -524,6 +522,120 @@ int schedulerUpdate(CopyScheduler *sched, SharedState *sharedState,
     return EINPROGRESS;
 }
 
+void recursiveRemoveNonDirectory(StringPartRef path, SharedState *sharedState,
+                                 int dstRootFD, size_t currentDepth = 0) {
+    StringPartGuard guard{.alloc = globalAllocator, .ref = path};
+
+    thread_local size_t remoteBufSize = PATH_MAX;
+    thread_local AllocRef remoteBuf =
+        AllocatorAllocate(globalAllocator, remoteBufSize);
+
+    int ok = (!stringrefMemcpyWithRealloc(globalAllocator, path, &remoteBuf,
+                                          &remoteBufSize));
+    assert(ok);
+
+    const char *remote =
+        (const char *)allocDeref(globalAllocator, remoteBuf, remoteBufSize);
+
+    spdlog::debug("removing {}", remote);
+    if (unlinkat_wrapper(sharedState, dstRootFD, remote, 0) < 0) {
+        spdlog::error("failed to remove file {}: {}", remote, strerror(errno));
+    }
+
+    for (size_t i = 0; i <= currentDepth; i++) {
+        char *pathDelim = (char *)strrchr(remote, '/');
+
+        if (pathDelim) {
+            *pathDelim = '\0';
+        } else {
+            break;
+        }
+
+        spdlog::debug("removing directory {}", remote);
+        if (unlinkat_wrapper(sharedState, dstRootFD, remote, AT_REMOVEDIR) <
+            0) {
+            if (errno != ENOTEMPTY && errno != ENOENT) {
+                spdlog::error("failed to remove directory {}: {}", remote,
+                              strerror(errno));
+            }
+
+            break;
+        }
+    }
+}
+
+void recursiveRemoveDirectory(StringPartRef path, SharedState *sharedState,
+                              int dstRootFD, size_t currentDepth = 0,
+                              bool silentOpenFail = false) {
+    StringPartGuard guard{.alloc = globalAllocator, .ref = path};
+
+    thread_local size_t remoteBufSize = PATH_MAX;
+    thread_local AllocRef remoteBuf =
+        AllocatorAllocate(globalAllocator, remoteBufSize);
+
+    int ok = (!stringrefMemcpyWithRealloc(globalAllocator, path, &remoteBuf,
+                                          &remoteBufSize));
+    assert(ok);
+
+    const char *remote =
+        (const char *)allocDeref(globalAllocator, remoteBuf, remoteBufSize);
+
+    int fd = openat_wrapper(sharedState, dstRootFD, remote,
+                            O_RDONLY | O_DIRECTORY | O_NOATIME, 0);
+
+    if (fd < 0) {
+        if (!silentOpenFail) {
+            spdlog::error("failed to open destination directory {}: {}", remote,
+                          strerror(errno));
+        }
+        return;
+    }
+
+    DIR *dir = fdopendir_wrapper(sharedState, fd);
+
+    struct dirent *d;
+    while ((d = readdir_wrapper(sharedState, dir))) {
+        if (ISDOT(d->d_name)) {
+            continue;
+        }
+
+        StringPartRef newPathRef = toStringPart(globalAllocator, path, "/", 1,
+                                                d->d_name, strlen(d->d_name));
+        if (d->d_type == DT_DIR) {
+#pragma omp task
+            recursiveRemoveDirectory(newPathRef, sharedState, dstRootFD,
+                                     currentDepth + 1);
+        } else {
+#pragma omp task
+            recursiveRemoveNonDirectory(newPathRef, sharedState, dstRootFD,
+                                        currentDepth);
+        }
+    }
+
+    closedir_wrapper(sharedState, dir);
+
+    for (size_t i = 0; i <= currentDepth; i++) {
+        spdlog::debug("removing directory {}", remote);
+        if (unlinkat_wrapper(sharedState, dstRootFD, remote, AT_REMOVEDIR) <
+            0) {
+            if (errno != ENOTEMPTY && errno != ENOENT) {
+                spdlog::error("failed to remove directory {}: {}", remote,
+                              strerror(errno));
+            }
+
+            break;
+        }
+
+        char *pathDelim = (char *)strrchr(remote, '/');
+
+        if (pathDelim) {
+            *pathDelim = '\0';
+        } else {
+            break;
+        }
+    }
+}
+
 int processNonDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
                   int destRootFD, SharedState *sharedState) {
     StringPartGuard pathGuard{globalAllocator, path};
@@ -599,7 +711,7 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
     bool isPendingHardlink = false;
     bool isFirstLook = false;
 
-    if (stx.stx_nlink > 1) {
+    if (stx.stx_nlink > 1 || destStx.stx_nlink > 1) {
         hlinkStateRegisterLinkRoot(
             sharedState, &sharedState->hlinkState, globalAllocator, remote,
             path, stx.stx_ino, destStx.stx_ino, exists, stx.stx_nlink,
@@ -720,6 +832,7 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
 int processDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
                int destRootFD, SharedState *sharedState) {
     assert(!isNullRef(path));
+    StringPartGuard pathGuard{globalAllocator, path};
 
     thread_local size_t remoteBufSize = PATH_MAX;
     thread_local AllocRef remoteBuf =
@@ -860,6 +973,13 @@ void finishProcessorOne(SharedState *sharedState, FileCopyJob &fileJob) {
         spdlog::error("{} failed with {} errors", fileJob, fileJob.nErrors);
         partialDeleted = fileJobSuccess = false;
     } else {
+//         if (!isNullRef(fileJob.partial)) {
+//             recursiveRemoveDirectory(
+//                 STRING_PART_RC_INC(globalAllocator, fileJob.remote),
+//                 sharedState, sharedState->destRootFD, 0, true);
+// #pragma omp taskwait
+//         }
+
         struct timespec times[] = {
             {.tv_nsec = UTIME_OMIT},
             {.tv_sec = fileJob.stx.stx_mtime.tv_sec,
@@ -1521,12 +1641,15 @@ int main(int argc, char *argv[]) {
     auto logger = std::make_shared<spdlog::logger>(
         spdlog::logger("copy2", {err_logger, file_sink}));
     logger->set_level(spdlog::level::trace);
+    spdlog::register_logger(logger);
     spdlog::set_default_logger(logger);
 
     if (argc < 3) {
         spdlog::error("please specify a source and a destination path");
         return 1;
     }
+
+    logger->flush_on(spdlog::level::trace);
 
     const char *root = opts.src.c_str();
     const char *dest = opts.dest.c_str();
@@ -1559,6 +1682,7 @@ int main(int argc, char *argv[]) {
 
     SharedState *sharedState = new SharedState;
     sharedState->opts = opts;
+    sharedState->logger = logger;
 
     sharedState->jobQueue =
         Queue(std::min((size_t)60000, sharedState->opts.maxFDs));
@@ -1608,6 +1732,8 @@ int main(int argc, char *argv[]) {
 
     StringPartRef rootRef =
         toStringPart(globalAllocator, {}, ".", 1, nullptr, 0);
+
+    spdlog::info("logger is {}", (void*)spdlog::default_logger_raw());
 
 #ifndef NDEBUG
     testingSyscallBehaviorMatrix.s = {};
@@ -1667,6 +1793,8 @@ int main(int argc, char *argv[]) {
 
     spdlog::info("copying finished in {}s",
                  (size_t)(omp_get_wtime() - starttime));
+
+    spdlog::shutdown();
 
     return ret;
 }

@@ -59,7 +59,7 @@ struct Allocator {
 
 inline void *allocDeref(const Allocator *alloc, AllocRef ref,
                         size_t expectedSize = 0) {
-    // return ref.ptr;
+    return ref.ptr;
 #ifdef ALLOC_DEBUG
     // assert that the allocation ref thinks it's allocated
     assert(ref.ptr);

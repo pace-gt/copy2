@@ -55,12 +55,13 @@ found:
 
 static void flushCache(HLinkState *state, MDB_env *env, MDB_txn **txn,
                        pairmap &cache, MDB_dbi dbi) {
+    spdlog::trace("flushing hlink cache...");
     for (const auto &[k, v] : cache) {
         MDB_val mdbv = {}, mdbk = {};
         mdbv.mv_data = (void *)&v;
         mdbv.mv_size = sizeof(AllocRef);
         mdbk.mv_data = (void *)&k;
-        mdbk.mv_size = sizeof(AllocRef);
+        mdbk.mv_size = sizeof(uint64_t);
 
         int err;
         if ((err = mdb_put(*txn, dbi, &mdbk, &mdbv, 0))) {
@@ -74,7 +75,7 @@ static void flushCache(HLinkState *state, MDB_env *env, MDB_txn **txn,
     int err = 0;
 
     mdb_txn_commit(*txn);
-    txn = NULL;
+    *txn = NULL;
     if ((err = mdb_txn_begin(env, NULL, 0, txn))) {
         fprintf(stderr,
                 "ERROR: failed to begin mdb read transaction: "
@@ -184,6 +185,10 @@ reroll:
 
     if (haveSrcState) {
         hinfo = (HLinkInfo *)allocDeref(alloc, hinfoRef, sizeof(HLinkInfo));
+
+        spdlog::trace("src hlink state found for {} (inode={})", remote,
+                      srcInode);
+
         bool wrongInode = destInode != hinfo->destInode;
         if (!destExists || wrongInode) {
             thread_local size_t linkRootBufSize = 4096;
@@ -220,12 +225,12 @@ reroll:
                     return;
                 }
 
-                hinfo->nlinkRC--; // this can underflow, however it's fine
-                                  // because once all readers release their
-                                  // locks, the thread who observes the refcount
-                                  // go to 0 deletes and frees
+                // this can underflow, however it's fine
+                // because once all readers release their
+                // locks, the thread who observes the refcount
+                // go to 0 deletes and frees
 
-                if (!hinfo->nlinkRC) {
+                if (!(hinfo->nlinkRC--)) {
                     hinfo->lock.unlock();
                     pthread_rwlock_unlock(&state->lock);
                     pthread_rwlock_wrlock(&state->lock); // promote lock
@@ -234,6 +239,8 @@ reroll:
                                  state->forwardTableCache, state->forwardTable,
                                  srcInode, &hinfoRef)) {
                         hinfo->lock.lock();
+                        spdlog::trace("deleting pair for {} (inode={})", remote,
+                                      srcInode);
                         deletePair(state, state->wrTxn, state->env,
                                    state->forwardTable,
                                    state->forwardTableCache, srcInode);
@@ -263,6 +270,8 @@ reroll:
             }
         }
     } else {
+        spdlog::trace("src hlink state not found for {} (inode={})", remote,
+                      srcInode);
         pthread_rwlock_unlock(&state->lock);
         pthread_rwlock_wrlock(&state->lock); // promote lock
         haveWrlock = true;
@@ -274,6 +283,9 @@ reroll:
                      state->forwardTable, srcInode, &hinfoRef);
 
         if (haveSrcState) {
+            spdlog::trace(
+                "src hlink state now found for {} (inode={})...rerolling",
+                remote, srcInode);
             pthread_rwlock_unlock(&state->lock);
             goto reroll;
         }
@@ -286,8 +298,11 @@ reroll:
         hinfo->remote = STRING_PART_RC_INC(alloc, remoteRef);
         hinfo->destInode = destInode;
         hinfo->transferred = false;
-        hinfo->nlinkRC = srcNLinksExpected - 1;
-        assert(srcNLinksExpected > 1);
+        hinfo->nlinkRC = srcNLinksExpected;
+        // assert(srcNLinksExpected > 1);
+        // if (!hinfo->nlinkRC) {
+        //     hinfo->nlinkRC = 1;
+        // }
 
         writePair(state, &state->wrTxn, state->env, state->forwardTable,
                   state->forwardTableCache, state->maxTableCacheSize, srcInode,
@@ -325,7 +340,7 @@ reroll_dststate:
         revinfo =
             (HLinkInfoRev *)allocDeref(alloc, revinfoRef, sizeof(HLinkInfoRev));
         assert(destNLinksExpected > 0);
-        revinfo->nlinkRC = destNLinksExpected - 1;
+        revinfo->nlinkRC = destNLinksExpected; // - 1;
         revinfo->srcInode = *shouldTransfer ? UINT64_MAX : srcInode;
 
         writePair(state, &state->wrTxn, state->env, state->revTable,
@@ -360,6 +375,10 @@ reroll_dststate:
     }
 
     pthread_rwlock_unlock(&state->lock);
+
+    spdlog::trace("hlink determination for {} is shouldTransfer={}, "
+                  "isFirstLook={}, isPendingHardlink={}",
+                  remote, *shouldTransfer, *isFirstLook, *isPendingHardlink);
 
     assert(!(*isPendingHardlink && *isFirstLook));
 }
