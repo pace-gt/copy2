@@ -45,6 +45,41 @@
 #include <unistd.h>
 #include <utility>
 
+struct FDRCGuard {
+    std::string path;
+    FDRCRef fdrcRef;
+    SharedState *sharedState;
+    FDRCGuard(SharedState *sharedState, FDRCRef fdrc)
+        : fdrcRef(fdrc), sharedState(sharedState) {}
+
+    int fd() {
+        FDRC *fdrc = (FDRC *)allocDeref(globalAllocator, fdrcRef, sizeof(FDRC));
+        return fdrc->fd;
+    }
+
+    FDRCRef incref() {
+        FDRC *fdrc = (FDRC *)allocDeref(globalAllocator, fdrcRef, sizeof(FDRC));
+        fdrc->rc++;
+
+        return fdrcRef;
+    };
+
+    FDRC *deref() {
+        FDRC *fdrc = (FDRC *)allocDeref(globalAllocator, fdrcRef, sizeof(FDRC));
+        return fdrc;
+    }
+
+    ~FDRCGuard() {
+        FDRC *fdrc = (FDRC *)allocDeref(globalAllocator, fdrcRef, sizeof(FDRC));
+        size_t rc = fdrc->rc--;
+
+        if (rc == 1) {
+            close_wrapper(sharedState, fdrc->fd);
+            AllocatorFree(globalAllocator, fdrcRef);
+        }
+    }
+};
+
 #define INITIAL_READLINK_BUF_SIZE 512
 
 #define ISDOT(a) (a[0] == '.' && (!a[1] || (a[1] == '.' && !a[2])))
@@ -636,9 +671,12 @@ void recursiveRemoveDirectory(StringPartRef path, SharedState *sharedState,
     }
 }
 
-int processNonDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
-                  int destRootFD, SharedState *sharedState) {
+int processNonDir(StringPartRef path, std::optional<dev_t> dev,
+                  FDRCRef srcParentFDRef, FDRCRef dstParentFDRef,
+                  SharedState *sharedState) {
     StringPartGuard pathGuard{globalAllocator, path};
+    FDRCGuard srcFDGuard(sharedState, srcParentFDRef);
+    FDRCGuard dstFDGuard(sharedState, dstParentFDRef);
 
     assert(!isNullRef(path));
 
@@ -662,6 +700,12 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
 
     const char *remote =
         (const char *)allocDeref(globalAllocator, remoteBuf, remoteBufSize);
+    const char *name = strrchr(remote, '/');
+    if (!name) {
+        name = remote;
+    } else {
+        name++;
+    }
 
     snprintf(suffixBuf, suffixBufLen, "%016lX.partial",
              XXH3_64bits_withSeed(remote, strlen(remote), 0));
@@ -681,14 +725,14 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
     bool exists = true;
 
     struct statx stx;
-    if (statx_wrapper(sharedState, srcRootFD, remote, AT_SYMLINK_NOFOLLOW,
+    if (statx_wrapper(sharedState, srcFDGuard.fd(), name, AT_SYMLINK_NOFOLLOW,
                       STATX_BASIC_STATS, &stx) < 0) {
         spdlog::error("Failed to statx src {}: {}\n", remote, strerror(errno));
         return 1;
     }
 
     struct statx destStx = {};
-    if (statx_wrapper(sharedState, destRootFD, remote, AT_SYMLINK_NOFOLLOW,
+    if (statx_wrapper(sharedState, dstFDGuard.fd(), name, AT_SYMLINK_NOFOLLOW,
                       STATX_BASIC_STATS, &destStx) < 0) {
 
         if (errno == ENOENT) {
@@ -715,8 +759,8 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
         hlinkStateRegisterLinkRoot(
             sharedState, &sharedState->hlinkState, globalAllocator, remote,
             path, stx.stx_ino, destStx.stx_ino, exists, stx.stx_nlink,
-            destStx.stx_nlink, destRootFD, &shouldTransfer, &isFirstLook,
-            &isPendingHardlink);
+            destStx.stx_nlink, sharedState->destRootFD, &shouldTransfer,
+            &isFirstLook, &isPendingHardlink);
         if (isPendingHardlink) {
             shouldTransfer = false;
         }
@@ -728,12 +772,19 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
         sharedState->totalBytesSeen += stx.stx_size;
     }
 
+    const char *partialName = strrchr(partial, '/');
+    if (partialName) {
+        partialName++;
+    } else {
+        partialName = partial;
+    }
+
     if (shouldTransfer) {
-        unlinkat_wrapper(sharedState, destRootFD, partial, 0);
+        unlinkat_wrapper(sharedState, dstFDGuard.fd(), partialName, 0);
 
         if (S_ISREG(stx.stx_mode)) {
 
-            int srcFd = openat_wrapper(sharedState, srcRootFD, remote,
+            int srcFd = openat_wrapper(sharedState, srcFDGuard.fd(), name,
                                        O_RDONLY | O_DIRECT | O_NOATIME, 0);
             if (srcFd < 0) {
                 spdlog::error("failed to open src {}: {}\n", remote,
@@ -741,9 +792,9 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
                 return 1;
             }
 
-            int dstFd = openat_wrapper(sharedState, destRootFD, partial,
-                                       O_RDWR | O_CREAT | O_DIRECT | O_NOATIME,
-                                       stx.stx_mode);
+            int dstFd = openat_wrapper(
+                sharedState, dstFDGuard.fd(), partialName,
+                O_RDWR | O_CREAT | O_DIRECT | O_NOATIME, stx.stx_mode);
 
             if (dstFd < 0) {
                 spdlog::error("failed to open dest {}: {}", remote,
@@ -778,14 +829,15 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
                 .blockSize = blockSize(stx.stx_size, 64ULL * (1ULL << 20),
                                        sharedState->opts.minBlockSize,
                                        sharedState->opts.maxBlockSize),
+                .dstDirFD = dstFDGuard.incref(),
             });
 
 #undef CLEAN
         } else if (S_ISLNK(stx.stx_mode)) {
 
             // symlinkat(, int tofd, const char *to)
-            char *contents =
-                readSymlink(sharedState, globalAllocator, srcRootFD, remote);
+            char *contents = readSymlink(sharedState, globalAllocator,
+                                         srcFDGuard.fd(), name);
 
             if (!contents) {
                 spdlog::error("failed to read symlink {}", remote);
@@ -793,8 +845,8 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
             }
 
             spdlog::trace("performing symlink {}->{}", remote, contents);
-            if (symlinkat_wrapper(sharedState, contents, destRootFD, partial) <
-                0) {
+            if (symlinkat_wrapper(sharedState, contents, dstFDGuard.fd(),
+                                  partialName) < 0) {
                 spdlog::error("failed to symlinkat {}: {}", remote,
                               strerror(errno));
                 return 1;
@@ -808,6 +860,7 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
                     .stx = stx,
                     .srcFd = -1,
                     .dstFd = -1,
+                    .dstDirFD = dstFDGuard.incref(),
                 });
             }
         }
@@ -820,6 +873,7 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
                 .stx = stx,
                 .srcFd = -1,
                 .dstFd = -1,
+                .dstDirFD = dstFDGuard.incref(),
             });
         } else if (!isPendingHardlink && !isFirstLook) {
             sharedState->nFinished++;
@@ -829,10 +883,14 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
     return 0;
 }
 
-int processDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
-               int destRootFD, SharedState *sharedState) {
+int processDir(StringPartRef path, std::optional<dev_t> dev,
+               FDRCRef srcParentFDRef, FDRCRef dstParentFDRef,
+               SharedState *sharedState) {
     assert(!isNullRef(path));
     StringPartGuard pathGuard{globalAllocator, path};
+
+    FDRCGuard srcFDGuard(sharedState, srcParentFDRef);
+    FDRCGuard dstFDGuard(sharedState, dstParentFDRef);
 
     thread_local size_t remoteBufSize = PATH_MAX;
     thread_local AllocRef remoteBuf =
@@ -843,8 +901,14 @@ int processDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
 
     const char *remote =
         (const char *)allocDeref(globalAllocator, remoteBuf, remoteBufSize);
+    const char *name = strrchr(remote, '/');
+    if (!name) {
+        name = remote;
+    } else {
+        name++;
+    }
 
-    int fd = openat_wrapper(sharedState, srcRootFD, remote,
+    int fd = openat_wrapper(sharedState, srcFDGuard.fd(), name,
                             O_RDONLY | O_DIRECTORY | O_NOATIME, 0);
     if (fd < 0) {
         spdlog::error("failed to open directory {}: {}({})", remote, errno,
@@ -853,8 +917,8 @@ int processDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
     }
 
     struct statx stx;
-    int ret = statx_wrapper(sharedState, srcRootFD, remote, AT_SYMLINK_NOFOLLOW,
-                            STATX_BASIC_STATS, &stx);
+    int ret = statx_wrapper(sharedState, srcFDGuard.fd(), name,
+                            AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &stx);
 
     if (ret < 0) {
         spdlog::error("failed to stat {}: {} ({})\n", remote, errno,
@@ -870,11 +934,38 @@ int processDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
     }
 
     if (remote[0] &&
-        mkdirat_wrapper(sharedState, destRootFD, remote, stx.stx_mode) < 0 &&
+        mkdirat_wrapper(sharedState, dstFDGuard.fd(), name, stx.stx_mode) < 0 &&
         errno != EEXIST) {
         spdlog::error("failed to mkdir {}: {}", remote, strerror(errno));
         return -1;
     }
+
+    sem_wait(&sharedState->fdSem);
+    int newSrcFD = dup(fd);
+    if (newSrcFD < 0) {
+        spdlog::error("failed to duplicate src fd for {}: {}({})", remote,
+                      errno, strerror(errno));
+        return -1;
+    }
+
+    int newDstFD = openat_wrapper(sharedState, dstFDGuard.fd(), name,
+                                  O_DIRECTORY | O_NOATIME, 0);
+    if (newDstFD < 0) {
+        spdlog::error("failed to open dst dir {}: {}({})", remote, errno,
+                      strerror(errno));
+        return -1;
+    }
+
+    FDRCRef newSrcFDRef = AllocatorAllocate(globalAllocator, sizeof(FDRC));
+    FDRCRef newDstFDRef = AllocatorAllocate(globalAllocator, sizeof(FDRC));
+
+    FDRCGuard newSrcFDRefGuard(sharedState, newSrcFDRef);
+    newSrcFDRefGuard.deref()->fd = newSrcFD;
+    newSrcFDRefGuard.deref()->rc = 1;
+
+    FDRCGuard newDstFDRefGuard(sharedState, newDstFDRef);
+    newDstFDRefGuard.deref()->fd = newDstFD;
+    newDstFDRefGuard.deref()->rc = 1;
 
     DIR *dir = fdopendir_wrapper(sharedState, fd);
     if (!dir) {
@@ -887,22 +978,32 @@ int processDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
 
     sharedState->ndirs++;
 
-    struct dirent *d;
-    while ((d = readdir_wrapper(sharedState, dir))) {
-        if (ISDOT(d->d_name)) {
-            continue;
-        }
+    // #pragma omp taskgroup
+    {
+        struct dirent *d;
+        while ((d = readdir_wrapper(sharedState, dir))) {
+            if (ISDOT(d->d_name)) {
+                continue;
+            }
 
-        if (d->d_type == DT_DIR) {
-            StringPartRef newPathRef = toStringPart(
-                globalAllocator, path, "/", 1, d->d_name, strlen(d->d_name));
+            newDstFDRefGuard.incref();
+            newSrcFDRefGuard.incref();
+
+            if (d->d_type == DT_DIR) {
+                StringPartRef newPathRef =
+                    toStringPart(globalAllocator, path, "/", 1, d->d_name,
+                                 strlen(d->d_name));
 #pragma omp task
-            processDir(newPathRef, dev, srcRootFD, destRootFD, sharedState);
-        } else {
-            StringPartRef newPathRef = toStringPart(
-                globalAllocator, path, "/", 1, d->d_name, strlen(d->d_name));
+                processDir(newPathRef, dev, newSrcFDRef,
+                           newDstFDRefGuard.incref(), sharedState);
+            } else {
+                StringPartRef newPathRef =
+                    toStringPart(globalAllocator, path, "/", 1, d->d_name,
+                                 strlen(d->d_name));
 #pragma omp task
-            processNonDir(newPathRef, dev, srcRootFD, destRootFD, sharedState);
+                processNonDir(newPathRef, dev, newSrcFDRefGuard.incref(),
+                              newDstFDRef, sharedState);
+            }
         }
     }
 
@@ -915,6 +1016,7 @@ int processDir(StringPartRef path, std::optional<dev_t> dev, int srcRootFD,
         .stx = stx,
         .srcFd = -1,
         .dstFd = -1,
+        .dstDirFD = dstFDGuard.incref(),
     });
 
     return 0;
@@ -951,15 +1053,32 @@ void finishProcessorOne(SharedState *sharedState, FileCopyJob &fileJob) {
         assert(ok);
     }
 
+    FDRCGuard dstFDGuard(sharedState, fileJob.dstDirFD);
+
     const char *partial =
         (const char *)allocDeref(globalAllocator, partialBuf, partialBufSize);
+
+    const char *dstFileName = !isNullRef(fileJob.partial)
+                                  ? strrchr(partial, '/')
+                                  : strrchr(remote, '/');
+    if (!dstFileName) {
+        dstFileName = !isNullRef(fileJob.partial) ? partial : remote;
+    } else {
+        dstFileName++;
+    }
+
+    const char *dstRemoteName = strrchr(remote, '/');
+    if (!dstRemoteName) {
+        dstRemoteName = remote;
+    } else {
+        dstRemoteName++;
+    }
 
     bool fileJobSuccess = true;
     bool partialDeleted = true;
 
     struct statx destStx = {};
-    if (statx_wrapper(sharedState, sharedState->destRootFD,
-                      !isNullRef(fileJob.partial) ? partial : remote,
+    if (statx_wrapper(sharedState, dstFDGuard.fd(), dstFileName,
                       AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &destStx) < 0) {
         spdlog::error("{} failed to stat destination: {} ", fileJob,
                       strerror(errno));
@@ -973,12 +1092,13 @@ void finishProcessorOne(SharedState *sharedState, FileCopyJob &fileJob) {
         spdlog::error("{} failed with {} errors", fileJob, fileJob.nErrors);
         partialDeleted = fileJobSuccess = false;
     } else {
-//         if (!isNullRef(fileJob.partial)) {
-//             recursiveRemoveDirectory(
-//                 STRING_PART_RC_INC(globalAllocator, fileJob.remote),
-//                 sharedState, sharedState->destRootFD, 0, true);
-// #pragma omp taskwait
-//         }
+        //         if (!isNullRef(fileJob.partial)) {
+        //             recursiveRemoveDirectory(
+        //                 STRING_PART_RC_INC(globalAllocator,
+        //                 fileJob.remote), sharedState,
+        //                 sharedState->destRootFD, 0, true);
+        // #pragma omp taskwait
+        //         }
 
         struct timespec times[] = {
             {.tv_nsec = UTIME_OMIT},
@@ -990,31 +1110,31 @@ void finishProcessorOne(SharedState *sharedState, FileCopyJob &fileJob) {
             (spdlog::trace("{} finish queue linking "
                            "partial to remote {} -> {}",
                            fileJob, partial, remote),
-             renameat_wrapper(sharedState, sharedState->destRootFD, partial,
-                              sharedState->destRootFD, remote) < 0)) {
+             renameat_wrapper(sharedState, dstFDGuard.fd(), dstFileName,
+                              dstFDGuard.fd(), dstRemoteName) < 0)) {
             spdlog::error("{} failed to perform partial to "
                           "remote link {} -> {}: {} ",
                           fileJob, partial, remote, strerror(errno));
             fileJobSuccess = false;
             partialDeleted = false;
         } else if ((destStx.stx_mtime.tv_sec != fileJob.stx.stx_mtime.tv_sec) &&
-                   utimensat_wrapper(sharedState, sharedState->destRootFD,
-                                     remote, times, AT_SYMLINK_NOFOLLOW) < 0) {
+                   utimensat_wrapper(sharedState, dstFDGuard.fd(),
+                                     dstRemoteName, times,
+                                     AT_SYMLINK_NOFOLLOW) < 0) {
             spdlog::error("{} failed to set modification times : {} ", fileJob,
                           strerror(errno));
             fileJobSuccess = false;
         } else if (!S_ISLNK(fileJob.stx.stx_mode) &&
                    (destStx.stx_mode != fileJob.stx.stx_mode) &&
-                   fchmodat_wrapper(sharedState, sharedState->destRootFD,
-                                    remote, fileJob.stx.stx_mode, 0) < 0) {
+                   fchmodat_wrapper(sharedState, dstFDGuard.fd(), dstRemoteName,
+                                    fileJob.stx.stx_mode, 0) < 0) {
             spdlog::error("{} failed to set mode: {} ", fileJob,
                           strerror(errno));
             fileJobSuccess = false;
         } else if ((destStx.stx_uid != fileJob.stx.stx_uid ||
                     destStx.stx_gid != fileJob.stx.stx_gid) &&
-                   fchownat_wrapper(sharedState, sharedState->destRootFD,
-                                    remote, fileJob.stx.stx_uid,
-                                    fileJob.stx.stx_gid,
+                   fchownat_wrapper(sharedState, dstFDGuard.fd(), dstRemoteName,
+                                    fileJob.stx.stx_uid, fileJob.stx.stx_gid,
                                     AT_SYMLINK_NOFOLLOW) < 0) {
             spdlog::error("{} failed to chown: {} ", fileJob, strerror(errno));
             fileJobSuccess = false;
@@ -1041,7 +1161,7 @@ void finishProcessorOne(SharedState *sharedState, FileCopyJob &fileJob) {
     }
 
     if (!partialDeleted && !isNullRef(fileJob.partial)) {
-        unlinkat_wrapper(sharedState, sharedState->destRootFD, partial, 0);
+        unlinkat_wrapper(sharedState, dstFDGuard.fd(), dstFileName, 0);
     }
 
     sharedState->nFinished++;
@@ -1067,401 +1187,6 @@ void finishProcessor(SharedState *sharedState) {
 
     sharedState->nFinishProcessorsDone++;
 }
-
-#ifndef NDEBUG
-void testProcessDir(SharedState *sharedState) {
-    // this is degenerate behavior, truly
-    size_t nSyscalls = sizeof(testingSyscallBehaviorMatrix.arr) /
-                       sizeof(TESTING_SYSCALL_BEHAVIOR);
-    const char *dirname = "emptydir";
-    FileCopyJob job;
-
-#define TESTING_PROCESS_DIR_PREAMBLE                                           \
-    unlinkat(sharedState->srcRootFD, dirname, AT_REMOVEDIR);                   \
-    unlinkat(sharedState->destRootFD, dirname, AT_REMOVEDIR);                  \
-    assert(faccessat(sharedState->srcRootFD, dirname, F_OK,                    \
-                     AT_SYMLINK_NOFOLLOW) != 0);                               \
-    assert(faccessat(sharedState->destRootFD, dirname, F_OK,                   \
-                     AT_SYMLINK_NOFOLLOW) != 0);                               \
-    assert(mkdirat(sharedState->srcRootFD, dirname, 0644) == 0);               \
-    assert(mkdirat(sharedState->destRootFD, dirname, 0644) == 0);              \
-    for (size_t i = 0; i < nSyscalls; i++) {                                   \
-        testingSyscallBehaviorMatrix.arr[i].behavior =                         \
-            TESTING_SYSCALL_BEHAVIOR::NOCALL;                                  \
-    }
-
-    // openat
-    TESTING_PROCESS_DIR_PREAMBLE;
-    testingSyscallBehaviorMatrix.s.openat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::FAIL;
-    // statx
-    // mkdirat
-    // fdopendir
-    // readdir
-    // closedir
-    assert(processDir(
-        toStringPart(globalAllocator, {}, dirname, strlen(dirname), "", 0),
-        std::nullopt, sharedState->srcRootFD, sharedState->destRootFD,
-        sharedState));
-    assert(!sharedState->finishQueue.wait_dequeue_timed(job, 100000));
-
-    // openat
-    TESTING_PROCESS_DIR_PREAMBLE;
-    testingSyscallBehaviorMatrix.s.openat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // statx
-    testingSyscallBehaviorMatrix.s.statx.behavior =
-        TESTING_SYSCALL_BEHAVIOR::FAIL;
-    // mkdirat
-    // fdopendir
-    // readdir
-    // closedir
-    assert(processDir(
-        toStringPart(globalAllocator, {}, dirname, strlen(dirname), "", 0),
-        std::nullopt, sharedState->srcRootFD, sharedState->destRootFD,
-        sharedState));
-    assert(!sharedState->finishQueue.wait_dequeue_timed(job, 10000));
-
-    // openat
-    TESTING_PROCESS_DIR_PREAMBLE;
-    testingSyscallBehaviorMatrix.s.openat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // statx
-    testingSyscallBehaviorMatrix.s.statx.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // mkdirat
-    testingSyscallBehaviorMatrix.s.mkdirat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::FAIL;
-    // fdopendir
-    // readdir
-    // closedir
-    assert(processDir(
-        toStringPart(globalAllocator, {}, dirname, strlen(dirname), "", 0),
-        std::nullopt, sharedState->srcRootFD, sharedState->destRootFD,
-        sharedState));
-    assert(!sharedState->finishQueue.wait_dequeue_timed(job, 10000));
-
-    // openat
-    TESTING_PROCESS_DIR_PREAMBLE;
-    testingSyscallBehaviorMatrix.s.openat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // statx
-    testingSyscallBehaviorMatrix.s.statx.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // mkdirat
-    testingSyscallBehaviorMatrix.s.mkdirat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // fdopendir
-    testingSyscallBehaviorMatrix.s.fdopendir.behavior =
-        TESTING_SYSCALL_BEHAVIOR::FAIL;
-    // readdir
-    // closedir
-    assert(processDir(
-        toStringPart(globalAllocator, {}, dirname, strlen(dirname), "", 0),
-        std::nullopt, sharedState->srcRootFD, sharedState->destRootFD,
-        sharedState));
-    assert(!sharedState->finishQueue.wait_dequeue_timed(job, 10000));
-
-    // openat
-    TESTING_PROCESS_DIR_PREAMBLE;
-    testingSyscallBehaviorMatrix.s.openat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // statx
-    testingSyscallBehaviorMatrix.s.statx.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // mkdirat
-    testingSyscallBehaviorMatrix.s.mkdirat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // fdopendir
-    testingSyscallBehaviorMatrix.s.fdopendir.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // readdir
-    testingSyscallBehaviorMatrix.s.readdir.behavior =
-        TESTING_SYSCALL_BEHAVIOR::FAIL;
-    // closedir
-    testingSyscallBehaviorMatrix.s.closedir.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    assert(!processDir(
-        toStringPart(globalAllocator, {}, dirname, strlen(dirname), "", 0),
-        std::nullopt, sharedState->srcRootFD, sharedState->destRootFD,
-        sharedState));
-    assert(sharedState->finishQueue.wait_dequeue_timed(job, 10000));
-    assert(!strcmp(stringrefImmediateToCString(globalAllocator, job.remote),
-                   dirname));
-    assert(isNullRef(job.partial));
-    assert(job.srcFd == -1);
-    assert(job.dstFd == -1);
-
-    // openat
-    TESTING_PROCESS_DIR_PREAMBLE;
-    testingSyscallBehaviorMatrix.s.openat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // statx
-    testingSyscallBehaviorMatrix.s.statx.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // mkdirat
-    testingSyscallBehaviorMatrix.s.mkdirat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // fdopendir
-    testingSyscallBehaviorMatrix.s.fdopendir.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // readdir
-    testingSyscallBehaviorMatrix.s.readdir.behavior =
-        TESTING_SYSCALL_BEHAVIOR::FAIL;
-    // closedir
-    testingSyscallBehaviorMatrix.s.closedir.behavior =
-        TESTING_SYSCALL_BEHAVIOR::FAIL;
-    assert(!processDir(
-        toStringPart(globalAllocator, {}, dirname, strlen(dirname), "", 0),
-        std::nullopt, sharedState->srcRootFD, sharedState->destRootFD,
-        sharedState));
-    assert(sharedState->finishQueue.wait_dequeue_timed(job, 10000));
-    assert(!strcmp(stringrefImmediateToCString(globalAllocator, job.remote),
-                   dirname));
-    assert(isNullRef(job.partial));
-    assert(job.srcFd == -1);
-    assert(job.dstFd == -1);
-
-    assert(unlinkat(sharedState->srcRootFD, dirname, AT_REMOVEDIR) == 0);
-    assert(unlinkat(sharedState->destRootFD, dirname, AT_REMOVEDIR) == 0);
-}
-
-void testFinishQueue(SharedState *sharedState) {
-    // this is degenerate behavior, truly
-    size_t nSyscalls = sizeof(testingSyscallBehaviorMatrix.arr) /
-                       sizeof(TESTING_SYSCALL_BEHAVIOR);
-    const char *text = "test text\n";
-    int fd;
-
-    // statx
-    // size mismatch
-    // transfer errors
-    // renameat
-    // utimensat
-    // fchmodat
-    // fchownat
-
-    const char *partialName = "testfile.txt.partial";
-    const char *remoteName = "testfile.txt";
-    FileCopyJob job;
-
-#define TEST_FINISH_QUEUE_PREAMBLE                                             \
-    job = {};                                                                  \
-    testingSyscallBehaviorMatrix = {};                                         \
-    unlinkat(sharedState->destRootFD, partialName, 0);                         \
-    unlinkat(sharedState->destRootFD, remoteName, 0);                          \
-    fd = openat(sharedState->destRootFD, partialName,                          \
-                O_RDWR | O_CREAT | O_DIRECT, 0644);                            \
-    assert(fd >= 0);                                                           \
-    assert(write(fd, text, strlen(text)) == strlen(text));                     \
-    close(fd);                                                                 \
-    fd = openat(sharedState->destRootFD, partialName,                          \
-                O_RDWR | O_CREAT | O_DIRECT, 0644);                            \
-    assert(fd >= 0);                                                           \
-    job.active = true;                                                         \
-    job.firstLook = true;                                                      \
-    job.actuallyTransferred = true;                                            \
-    job.partial = toStringPart(globalAllocator, {}, partialName,               \
-                               strlen(partialName), NULL, 0);                  \
-    job.remote = toStringPart(globalAllocator, {}, remoteName,                 \
-                              strlen(remoteName), NULL, 0);                    \
-    assert(statx(sharedState->destRootFD, partialName,                         \
-                 AT_SYMLINK_NOFOLLOW | AT_STATX_FORCE_SYNC, STATX_BASIC_STATS, \
-                 &job.stx) == 0);                                              \
-    job.srcFd = -1;                                                            \
-    job.dstFd = fd;                                                            \
-    job.nBlockJobsFinished = 1;                                                \
-    job.nBlockJobsScheduled = 0;                                               \
-    job.nErrors = 0;                                                           \
-    spdlog::info("bruh {}", job);                                              \
-    for (size_t i = 0; i < nSyscalls; i++) {                                   \
-        testingSyscallBehaviorMatrix.arr[i].behavior =                         \
-            TESTING_SYSCALL_BEHAVIOR::NOCALL;                                  \
-    }                                                                          \
-    testingSyscallBehaviorMatrix.s.close.behavior =                            \
-        TESTING_SYSCALL_BEHAVIOR::PASS;                                        \
-    testingSyscallBehaviorMatrix.s.unlinkat.behavior =                         \
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-
-    TEST_FINISH_QUEUE_PREAMBLE;
-
-    // statx
-    testingSyscallBehaviorMatrix.s.statx.behavior =
-        TESTING_SYSCALL_BEHAVIOR::FAIL;
-    // size mismatch
-    // errors
-    // renameat
-    // utimensat
-    // fchmodat
-    // fchownat
-    finishProcessorOne(sharedState, job);
-    assert(testingSyscallBehaviorMatrix.s.close.callCount == 1);
-    assert(testingSyscallBehaviorMatrix.s.unlinkat.callCount == 1);
-    assert(faccessat(sharedState->destRootFD, partialName, F_OK, 0) < 0 &&
-           errno == ENOENT);
-    assert(faccessat(sharedState->destRootFD, remoteName, F_OK, 0) < 0 &&
-           errno == ENOENT);
-
-    TEST_FINISH_QUEUE_PREAMBLE;
-    // statx
-    testingSyscallBehaviorMatrix.s.statx.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // size mismatch
-    job.stx.stx_size = 10000000;
-    // errors
-    // renameat
-    // utimensat
-    // fchmodat
-    // fchownat
-    finishProcessorOne(sharedState, job);
-    assert(testingSyscallBehaviorMatrix.s.statx.callCount == 1);
-    assert(testingSyscallBehaviorMatrix.s.close.callCount == 1);
-    assert(testingSyscallBehaviorMatrix.s.unlinkat.callCount == 1);
-    assert(faccessat(sharedState->destRootFD, partialName, F_OK, 0) < 0 &&
-           errno == ENOENT);
-    assert(faccessat(sharedState->destRootFD, remoteName, F_OK, 0) < 0 &&
-           errno == ENOENT);
-
-    TEST_FINISH_QUEUE_PREAMBLE;
-    // statx
-    testingSyscallBehaviorMatrix.s.statx.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // size mismatch
-    // errors
-    job.nErrors = 1;
-    // renameat
-    // utimensat
-    // fchmodat
-    // fchownat
-    finishProcessorOne(sharedState, job);
-    assert(testingSyscallBehaviorMatrix.s.statx.callCount == 1);
-    assert(testingSyscallBehaviorMatrix.s.close.callCount == 1);
-    assert(testingSyscallBehaviorMatrix.s.unlinkat.callCount == 1);
-    assert(faccessat(sharedState->destRootFD, partialName, F_OK, 0) < 0 &&
-           errno == ENOENT);
-    assert(faccessat(sharedState->destRootFD, remoteName, F_OK, 0) < 0 &&
-           errno == ENOENT);
-
-    TEST_FINISH_QUEUE_PREAMBLE;
-    // statx
-    testingSyscallBehaviorMatrix.s.statx.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // size mismatch
-    // errors
-    // renameat
-    testingSyscallBehaviorMatrix.s.renameat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::FAIL;
-    // utimensat
-    // fchmodat
-    // fchownat
-    finishProcessorOne(sharedState, job);
-    assert(testingSyscallBehaviorMatrix.s.statx.callCount == 1);
-    assert(testingSyscallBehaviorMatrix.s.close.callCount == 1);
-    assert(testingSyscallBehaviorMatrix.s.unlinkat.callCount == 1);
-    assert(faccessat(sharedState->destRootFD, partialName, F_OK, 0) < 0 &&
-           errno == ENOENT);
-    assert(faccessat(sharedState->destRootFD, remoteName, F_OK, 0) < 0 &&
-           errno == ENOENT);
-
-    TEST_FINISH_QUEUE_PREAMBLE;
-    job.stx.stx_mtime.tv_nsec++;
-    testingSyscallBehaviorMatrix.s.unlinkat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::NOCALL;
-    // statx
-    testingSyscallBehaviorMatrix.s.statx.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // size mismatch
-    // errors
-    // renameat
-    testingSyscallBehaviorMatrix.s.renameat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // utimensat
-    testingSyscallBehaviorMatrix.s.utimensat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::FAIL;
-    // fchmodat
-    // fchownat
-    finishProcessorOne(sharedState, job);
-    assert(testingSyscallBehaviorMatrix.s.statx.callCount == 1);
-    assert(testingSyscallBehaviorMatrix.s.renameat.callCount == 1);
-    assert(testingSyscallBehaviorMatrix.s.close.callCount == 1);
-    assert(faccessat(sharedState->destRootFD, partialName, F_OK, 0) < 0 &&
-           errno == ENOENT);
-    assert(faccessat(sharedState->destRootFD, remoteName, F_OK, 0) == 0);
-    assert(unlinkat(sharedState->destRootFD, remoteName, 0) == 0);
-
-    TEST_FINISH_QUEUE_PREAMBLE;
-    job.stx.stx_mtime.tv_sec++;
-    job.stx.stx_mode = 0;
-
-    testingSyscallBehaviorMatrix.s.unlinkat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::NOCALL;
-    // statx
-    testingSyscallBehaviorMatrix.s.statx.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // size mismatch
-    // errors
-    // renameat
-    testingSyscallBehaviorMatrix.s.renameat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // utimensat
-    testingSyscallBehaviorMatrix.s.utimensat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // fchmodat
-    testingSyscallBehaviorMatrix.s.fchmodat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::FAIL;
-    // fchownat
-    finishProcessorOne(sharedState, job);
-    assert(testingSyscallBehaviorMatrix.s.statx.callCount == 1);
-    assert(testingSyscallBehaviorMatrix.s.renameat.callCount == 1);
-    assert(testingSyscallBehaviorMatrix.s.utimensat.callCount == 1);
-    assert(testingSyscallBehaviorMatrix.s.close.callCount == 1);
-    assert(testingSyscallBehaviorMatrix.s.unlinkat.callCount == 0);
-    assert(faccessat(sharedState->destRootFD, partialName, F_OK, 0) < 0 &&
-           errno == ENOENT);
-    assert(faccessat(sharedState->destRootFD, remoteName, F_OK, 0) == 0);
-    assert(unlinkat(sharedState->destRootFD, remoteName, 0) == 0);
-
-    TEST_FINISH_QUEUE_PREAMBLE;
-    job.stx.stx_mtime.tv_sec++;
-    job.stx.stx_mode |= ~0777;
-    job.stx.stx_gid++;
-    job.stx.stx_uid++;
-
-    testingSyscallBehaviorMatrix.s.unlinkat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::NOCALL;
-    // statx
-    testingSyscallBehaviorMatrix.s.statx.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // size mismatch
-    // errors
-    // renameat
-    testingSyscallBehaviorMatrix.s.renameat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // utimensat
-    testingSyscallBehaviorMatrix.s.utimensat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // fchmodat
-    testingSyscallBehaviorMatrix.s.fchmodat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::PASS;
-    // fchownat
-    testingSyscallBehaviorMatrix.s.fchownat.behavior =
-        TESTING_SYSCALL_BEHAVIOR::FAIL;
-    finishProcessorOne(sharedState, job);
-    assert(testingSyscallBehaviorMatrix.s.statx.callCount == 1);
-    assert(testingSyscallBehaviorMatrix.s.renameat.callCount == 1);
-    assert(testingSyscallBehaviorMatrix.s.utimensat.callCount == 1);
-    assert(testingSyscallBehaviorMatrix.s.fchmodat.callCount == 1);
-    // assert(testingSyscallBehaviorMatrix.s.fchownat.callCount == 1);
-    assert(testingSyscallBehaviorMatrix.s.close.callCount == 1);
-    assert(testingSyscallBehaviorMatrix.s.unlinkat.callCount == 0);
-    assert(faccessat(sharedState->destRootFD, partialName, F_OK, 0) < 0 &&
-           errno == ENOENT);
-    assert(faccessat(sharedState->destRootFD, remoteName, F_OK, 0) == 0);
-    assert(unlinkat(sharedState->destRootFD, remoteName, 0) == 0);
-
-    testingSyscallBehaviorMatrix = {};
-}
-#endif
 
 void incrementalLogger(SharedState *sharedState) {
     double lastPrint = omp_get_wtime();
@@ -1602,9 +1327,9 @@ int main(int argc, char *argv[]) {
     cli.add_option("--readback", opts.readback,
                    "should we read transferred blocks back and run checksums?")
         ->default_val(false);
-    cli.add_option(
-           "--hlink-cache-members", opts.hlinkMemCacheMembers,
-           "number of hardlink entries to store in ram before writing to disk")
+    cli.add_option("--hlink-cache-members", opts.hlinkMemCacheMembers,
+                   "number of hardlink entries to store in ram before "
+                   "writing to disk")
         ->default_val(100000);
     cli.add_option("--hlink-disk-size", opts.hlinkDiskSize,
                    "maximum hlink store disk size")
@@ -1730,18 +1455,21 @@ int main(int argc, char *argv[]) {
     sharedState->destRootFD = destRootFD;
     sharedState->srcRootFD = srcRootFD;
 
+    FDRCRef srcRootFDRef = AllocatorAllocate(globalAllocator, sizeof(FDRC));
+    FDRCRef dstRootFDRef = AllocatorAllocate(globalAllocator, sizeof(FDRC));
+
+    FDRCGuard srcRootFDRefGuard(sharedState, srcRootFDRef);
+    srcRootFDRefGuard.deref()->fd = srcRootFD;
+    srcRootFDRefGuard.deref()->rc = 1;
+
+    FDRCGuard dstRootFDRefGuard(sharedState, dstRootFDRef);
+    dstRootFDRefGuard.deref()->fd = destRootFD;
+    dstRootFDRefGuard.deref()->rc = 1;
+
     StringPartRef rootRef =
         toStringPart(globalAllocator, {}, ".", 1, nullptr, 0);
 
-    spdlog::info("logger is {}", (void*)spdlog::default_logger_raw());
-
-#ifndef NDEBUG
-    testingSyscallBehaviorMatrix.s = {};
-    if (sharedState->opts.runTests) {
-        testProcessDir(sharedState);
-        testFinishQueue(sharedState);
-    }
-#endif
+    spdlog::info("logger is {}", (void *)spdlog::default_logger_raw());
 
     int ret = 0;
 #pragma omp parallel sections
@@ -1752,7 +1480,8 @@ int main(int argc, char *argv[]) {
 #pragma omp single
 #pragma omp taskgroup
             ret = processDir(STRING_PART_RC_INC(globalAllocator, rootRef),
-                             std::nullopt, srcRootFD, destRootFD, sharedState);
+                             std::nullopt, srcRootFDRefGuard.incref(),
+                             dstRootFDRefGuard.incref(), sharedState);
             sharedState->crawlDone = 1;
         }
 

@@ -36,6 +36,8 @@ struct FileCopyJob {
     size_t nBlockJobsScheduled;
     size_t nBlockJobsFinished;
     size_t nErrors;
+
+    FDRCRef dstDirFD;
 };
 
 enum RW {

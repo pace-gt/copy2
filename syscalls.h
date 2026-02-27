@@ -105,7 +105,7 @@ inline int fchownat_wrapper(SharedState *sharedState, int dirfd,
                             int flags) {
     TESTING_ASSERT_SYSCALL_BEHAVIOR(fchownat, -1);
     assert(path_ok(path));
-    assert(sharedState->destRootFD == dirfd);
+    // assert(sharedState->destRootFD == dirfd);
     assert(flags == AT_SYMLINK_NOFOLLOW);
 
     return fchownat(dirfd, path, owner, group, flags);
@@ -116,7 +116,7 @@ inline int fchmodat_wrapper(SharedState *sharedState, int dirfd,
                             const char *path, mode_t mode, int flags) {
     TESTING_ASSERT_SYSCALL_BEHAVIOR(fchmodat, -1);
     assert(path_ok(path));
-    assert(sharedState->destRootFD == dirfd);
+    // assert(sharedState->destRootFD == dirfd);
     assert(flags == 0);
 
     return fchmodat(dirfd, path, mode, flags);
@@ -125,8 +125,8 @@ inline int fchmodat_wrapper(SharedState *sharedState, int dirfd,
 // ftruncate
 inline int ftruncate_wrapper(SharedState *sharedState, int fd, off_t length) {
     TESTING_ASSERT_SYSCALL_BEHAVIOR(ftruncate, -1);
-    assert(sharedState->destRootFD != fd);
-    assert(sharedState->srcRootFD != fd);
+    // assert(sharedState->destRootFD != fd);
+    // assert(sharedState->srcRootFD != fd);
     assert(length >= 0);
 
     return ftruncate(fd, length);
@@ -139,7 +139,7 @@ inline int utimensat_wrapper(SharedState *sharedState, int dirfd,
     TESTING_ASSERT_SYSCALL_BEHAVIOR(utimensat, -1);
     assert(path_ok(path));
     assert(flags == AT_SYMLINK_NOFOLLOW);
-    assert(sharedState->destRootFD == dirfd);
+    // assert(sharedState->destRootFD == dirfd);
 
     return utimensat(dirfd, path, times, flags);
 }
@@ -149,7 +149,7 @@ inline int symlinkat_wrapper(SharedState *sharedState, const char *target,
                              int newdirfd, const char *linkpath) {
     TESTING_ASSERT_SYSCALL_BEHAVIOR(symlinkat, -1);
     assert(path_ok(linkpath));
-    assert(sharedState->destRootFD == newdirfd);
+    // assert(sharedState->destRootFD == newdirfd);
 
     return symlinkat(target, newdirfd, linkpath);
 }
@@ -158,7 +158,8 @@ inline int symlinkat_wrapper(SharedState *sharedState, const char *target,
 inline ssize_t readlinkat_wrapper(SharedState *sharedState, int dirfd,
                                   const char *path, char *buf, size_t bufsize) {
     TESTING_ASSERT_SYSCALL_BEHAVIOR(readlinkat, -1);
-    assert(sharedState->destRootFD == dirfd || sharedState->srcRootFD == dirfd);
+    // assert(sharedState->destRootFD == dirfd || sharedState->srcRootFD ==
+    // dirfd);
     assert(path_ok(path));
 
     return readlinkat(dirfd, path, buf, bufsize);
@@ -171,8 +172,8 @@ inline int renameat_wrapper(SharedState *sharedState, int olddirfd,
     TESTING_ASSERT_SYSCALL_BEHAVIOR(renameat, -1);
     assert(path_ok(oldpath));
     assert(path_ok(newpath));
-    assert(sharedState->destRootFD == olddirfd);
-    assert(sharedState->destRootFD == newdirfd);
+    // assert(sharedState->destRootFD == olddirfd);
+    // assert(sharedState->destRootFD == newdirfd);
 
     return renameat(olddirfd, oldpath, newdirfd, newpath);
 }
@@ -181,19 +182,23 @@ inline int closedir_wrapper(SharedState *sharedState, DIR *dirp) {
     TESTING_ASSERT_SYSCALL_BEHAVIOR(closedir, -1);
     assert(dirp);
     int rc = closedir(dirp);
-    sem_post(&sharedState->fdSem);
+    if (sem_post(&sharedState->fdSem)) {
+        assert(false);
+    }
 
     return rc;
 }
 
 inline int close_wrapper(SharedState *sharedState, int fd) {
     TESTING_ASSERT_SYSCALL_BEHAVIOR(close, -1);
-    assert(fd != sharedState->srcRootFD);
-    assert(fd != sharedState->destRootFD);
+    // assert(fd != sharedState->srcRootFD);
+    // assert(fd != sharedState->destRootFD);
     assert(fd);
 
     int rc = close(fd);
-    sem_post(&sharedState->fdSem);
+    if (sem_post(&sharedState->fdSem)) {
+        assert(false);
+    }
 
     return rc;
 }
@@ -203,13 +208,17 @@ inline int openat_wrapper(SharedState *sharedState, int dirfd, const char *path,
     TESTING_ASSERT_SYSCALL_BEHAVIOR(openat, -1);
     assert(path_ok(path));
     assert(dirfd > 0);
-    assert(sharedState->srcRootFD != dirfd ||
-           flags == (O_NOATIME | O_RDONLY | O_DIRECT) ||
-           flags == (O_NOATIME | O_DIRECTORY));
+    // assert(/*sharedState->srcRootFD != dirfd ||*/
+    //        flags == (O_NOATIME | O_RDONLY | O_DIRECT) ||
+    //        flags == (O_NOATIME | O_DIRECTORY | O_RDONLY) ||
+    //        flags == (O_NOATIME | O_DIRECTORY));
     assert(flags & O_DIRECTORY || flags & O_DIRECT);
-    assert(sharedState->destRootFD == dirfd || sharedState->srcRootFD == dirfd);
+    // assert(sharedState->destRootFD == dirfd || sharedState->srcRootFD ==
+    // dirfd);
 
-    sem_wait(&sharedState->fdSem);
+    if (sem_wait(&sharedState->fdSem)) {
+        assert(false);
+    }
 
     int rc = openat(dirfd, path, flags, mode);
 
@@ -222,8 +231,8 @@ inline int openat_wrapper(SharedState *sharedState, int dirfd, const char *path,
 
 inline DIR *fdopendir_wrapper(SharedState *sharedState, int fd) {
     TESTING_ASSERT_SYSCALL_BEHAVIOR(fdopendir, NULL);
-    assert(sharedState->destRootFD != fd);
-    assert(sharedState->srcRootFD != fd);
+    // assert(sharedState->destRootFD != fd);
+    // assert(sharedState->srcRootFD != fd);
 
     DIR *dir = fdopendir(fd);
     if (!dir) {
@@ -239,7 +248,7 @@ inline int statx_wrapper(SharedState *sharedState, int dirfd, const char *path,
     assert(path_ok(path));
     assert(flags == (AT_SYMLINK_NOFOLLOW));
     assert(mask);
-    assert(dirfd == sharedState->destRootFD || sharedState->srcRootFD);
+    // assert(dirfd == sharedState->destRootFD || sharedState->srcRootFD);
 
     double time = omp_get_wtime();
     int ret = statx(dirfd, path, flags, mask, statxbuf);
@@ -259,8 +268,8 @@ inline int linkat_wrapper(SharedState *sharedState, int olddirfd,
     assert(newpath);
     assert(olddirfd > 0);
     assert(olddirfd == newdirfd);
-    assert(sharedState->destRootFD == olddirfd);
-    assert(sharedState->destRootFD == newdirfd);
+    // assert(sharedState->destRootFD == olddirfd);
+    // assert(sharedState->destRootFD == newdirfd);
 
     return linkat(olddirfd, oldpath, newdirfd, newpath, flags);
 }
@@ -272,7 +281,7 @@ inline int unlinkat_wrapper(SharedState *sharedState, int dirfd,
     assert(flags == 0 || flags == AT_REMOVEDIR);
     assert(path);
     assert(dirfd >= 0);
-    assert(sharedState->destRootFD == dirfd);
+    // assert(sharedState->destRootFD == dirfd);
 
     return unlinkat(dirfd, path, flags);
 }
@@ -283,7 +292,7 @@ inline int mkdirat_wrapper(SharedState *sharedState, int dirfd,
     assert(path_ok(path));
     assert(path);
     assert(dirfd >= 0);
-    assert(sharedState->destRootFD == dirfd);
+    // assert(sharedState->destRootFD == dirfd);
 
     return mkdirat(dirfd, path, mode);
 }
@@ -302,7 +311,7 @@ struct FDRef {
 
 struct FDRefGuard {
     AllocRef fdref;
-    SharedState* sharedState;
+    SharedState *sharedState;
 
     int getFD() {
         FDRef *ref = (FDRef *)allocDeref(globalAllocator, fdref, sizeof(FDRef));

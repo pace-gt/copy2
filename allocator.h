@@ -48,13 +48,13 @@ struct Allocator {
 
     buddy *diskAlloc;
     buddy *memAlloc;
-    unsigned char* memBase;
+    unsigned char *memBase;
 
     void *copyBuffer;
 
     size_t nSubAllocators;
     size_t subAllocatorSize;
-    spinlock* subAllocatorLocks;
+    spinlock *subAllocatorLocks;
 };
 
 inline void *allocDeref(const Allocator *alloc, AllocRef ref,
@@ -122,7 +122,8 @@ struct StringPart {
 
 inline StringPart *stringPartDeref(const Allocator *alloc, StringPartRef ref) {
     StringPart *ptr = (StringPart *)allocDeref(alloc, ref);
-    ptr = (StringPart *)allocDeref(alloc, ref, 1 + ptr->len + sizeof(StringPart));
+    ptr =
+        (StringPart *)allocDeref(alloc, ref, 1 + ptr->len + sizeof(StringPart));
 
     return ptr;
 }
@@ -196,3 +197,9 @@ inline LinkEntryRef linkEntryAppend(Allocator *alloc, LinkEntryRef tip,
 void *buddy_base_ptr(buddy *bdy);
 
 extern Allocator *globalAllocator;
+
+struct FDRC {
+    std::atomic_size_t rc;
+    int fd;
+};
+typedef AllocRef FDRCRef;
