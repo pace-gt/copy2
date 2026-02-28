@@ -556,119 +556,105 @@ int schedulerUpdate(CopyScheduler *sched, SharedState *sharedState,
 
     return EINPROGRESS;
 }
+int recursiveRemoveNonDir(int dstfd, StringPartRef path,
+                          SharedState *sharedState) {
 
-void recursiveRemoveNonDirectory(StringPartRef path, SharedState *sharedState,
-                                 int dstRootFD, size_t currentDepth = 0) {
-    StringPartGuard guard{.alloc = globalAllocator, .ref = path};
-
+    StringPartGuard pathGuard{globalAllocator, path};
     thread_local size_t remoteBufSize = PATH_MAX;
     thread_local AllocRef remoteBuf =
         AllocatorAllocate(globalAllocator, remoteBufSize);
 
-    int ok = (!stringrefMemcpyWithRealloc(globalAllocator, path, &remoteBuf,
-                                          &remoteBufSize));
-    assert(ok);
+    stringrefMemcpyWithRealloc(globalAllocator, path, &remoteBuf,
+                               &remoteBufSize);
 
     const char *remote =
         (const char *)allocDeref(globalAllocator, remoteBuf, remoteBufSize);
 
-    spdlog::debug("removing {}", remote);
-    if (unlinkat_wrapper(sharedState, dstRootFD, remote, 0) < 0) {
-        spdlog::error("failed to remove file {}: {}", remote, strerror(errno));
+    spdlog::trace("recursiveRemoveNonDir: remove {}", remote);
+    if (unlinkat_wrapper(sharedState, dstfd, remote, 0) < 0) {
+        spdlog::error("recursiveRemoveNonDir failed to remove file {}: {}",
+                      remote, strerror(errno));
+        return -1;
     }
 
-    for (size_t i = 0; i <= currentDepth; i++) {
-        char *pathDelim = (char *)strrchr(remote, '/');
-
-        if (pathDelim) {
-            *pathDelim = '\0';
-        } else {
-            break;
-        }
-
-        spdlog::debug("removing directory {}", remote);
-        if (unlinkat_wrapper(sharedState, dstRootFD, remote, AT_REMOVEDIR) <
-            0) {
-            if (errno != ENOTEMPTY && errno != ENOENT) {
-                spdlog::error("failed to remove directory {}: {}", remote,
-                              strerror(errno));
-            }
-
-            break;
-        }
-    }
+    return 0;
 }
 
-void recursiveRemoveDirectory(StringPartRef path, SharedState *sharedState,
-                              int dstRootFD, size_t currentDepth = 0,
-                              bool silentOpenFail = false) {
-    StringPartGuard guard{.alloc = globalAllocator, .ref = path};
-
+int recursiveRemove(int dstfd, StringPartRef path, SharedState *sharedState,
+                    int depth = 0) {
+    StringPartGuard pathGuard{globalAllocator, path};
     thread_local size_t remoteBufSize = PATH_MAX;
     thread_local AllocRef remoteBuf =
         AllocatorAllocate(globalAllocator, remoteBufSize);
 
-    int ok = (!stringrefMemcpyWithRealloc(globalAllocator, path, &remoteBuf,
-                                          &remoteBufSize));
-    assert(ok);
+    stringrefMemcpyWithRealloc(globalAllocator, path, &remoteBuf,
+                               &remoteBufSize);
 
     const char *remote =
         (const char *)allocDeref(globalAllocator, remoteBuf, remoteBufSize);
 
-    int fd = openat_wrapper(sharedState, dstRootFD, remote,
-                            O_RDONLY | O_DIRECTORY | O_NOATIME, 0);
-
-    if (fd < 0) {
-        if (!silentOpenFail) {
-            spdlog::error("failed to open destination directory {}: {}", remote,
-                          strerror(errno));
-        }
-        return;
+    if (depth == 0 && unlinkat_wrapper(sharedState, dstfd, remote, 0) == 0) {
+        return 0;
+    } else if (depth == 0 && errno != EISDIR && errno != ENOENT) {
+        spdlog::error(
+            "recursiveRemove failed initial unlink pass on {} with error {}",
+            remote, strerror(errno));
+        return -1;
     }
 
-    DIR *dir = fdopendir_wrapper(sharedState, fd);
+    int dstDirFd =
+        openat_wrapper(sharedState, dstfd, remote, O_DIRECTORY | O_RDONLY, 0);
+    if (dstDirFd < 0) {
+        spdlog::error("recursiveRemove failed to open directory {}: {}", remote,
+                      strerror(errno));
+        return -1;
+    }
+    DIR *dstdir = fdopendir_wrapper(sharedState, dstDirFd);
 
-    struct dirent *d;
-    while ((d = readdir_wrapper(sharedState, dir))) {
-        if (ISDOT(d->d_name)) {
-            continue;
-        }
-
-        StringPartRef newPathRef = toStringPart(globalAllocator, path, "/", 1,
-                                                d->d_name, strlen(d->d_name));
-        if (d->d_type == DT_DIR) {
-#pragma omp task
-            recursiveRemoveDirectory(newPathRef, sharedState, dstRootFD,
-                                     currentDepth + 1);
-        } else {
-#pragma omp task
-            recursiveRemoveNonDirectory(newPathRef, sharedState, dstRootFD,
-                                        currentDepth);
-        }
+    if (!dstdir) {
+        spdlog::error("recursiveRemove failed to fdopnedir {}: {}", remote,
+                      strerror(errno));
+        return -1;
     }
 
-    closedir_wrapper(sharedState, dir);
+#pragma omp taskgroup
+    {
+        struct dirent *d;
+        while ((d = readdir(dstdir))) {
+            if (ISDOT(d->d_name))
+                continue;
 
-    for (size_t i = 0; i <= currentDepth; i++) {
-        spdlog::debug("removing directory {}", remote);
-        if (unlinkat_wrapper(sharedState, dstRootFD, remote, AT_REMOVEDIR) <
-            0) {
-            if (errno != ENOTEMPTY && errno != ENOENT) {
-                spdlog::error("failed to remove directory {}: {}", remote,
-                              strerror(errno));
+            StringPartRef newPathRef = toStringPart(
+                globalAllocator, path, "/", 1, d->d_name, strlen(d->d_name));
+
+            if (d->d_type == DT_DIR) {
+#pragma omp task
+                {
+                    recursiveRemove(dstfd, newPathRef, sharedState, depth + 1);
+                }
+            } else {
+#pragma omp task
+                {
+                    recursiveRemoveNonDir(dstfd, newPathRef, sharedState);
+                }
             }
-
-            break;
-        }
-
-        char *pathDelim = (char *)strrchr(remote, '/');
-
-        if (pathDelim) {
-            *pathDelim = '\0';
-        } else {
-            break;
         }
     }
+    closedir_wrapper(sharedState,
+                     dstdir); // Barrier 2: Release the handle BEFORE unlinking.
+    // Barrier 1: All files and sub-sub-dirs are definitely gone here.
+
+    // child tasks could have overwritten the thread local buffer
+    // this is terrible behavior, but such is the price we pay
+    stringrefMemcpyWithRealloc(globalAllocator, path, &remoteBuf,
+                               &remoteBufSize);
+    spdlog::trace("recursiveRemove: removing {}", remote);
+    if (unlinkat_wrapper(sharedState, dstfd, remote, AT_REMOVEDIR) < 0) {
+        spdlog::error("recursiveRemove failed to remove directory {}: {}",
+                      remote, strerror(errno));
+    }
+
+    return 0;
 }
 
 int processNonDir(StringPartRef path, std::optional<dev_t> dev,
@@ -967,6 +953,46 @@ int processDir(StringPartRef path, std::optional<dev_t> dev,
     newDstFDRefGuard.deref()->fd = newDstFD;
     newDstFDRefGuard.deref()->rc = 1;
 
+    sharedState->filesSeen++;
+
+    sharedState->ndirs++;
+
+    if (sharedState->opts.sync) {
+        sem_wait(&sharedState->fdSem);
+        int dstFdDup = dup(newDstFD);
+
+        if (dstFdDup < 0) {
+            spdlog::error("failed to duplicate dst fd for {}: {}", remote,
+                          strerror(errno));
+            return -1;
+        }
+
+        DIR *dir = fdopendir_wrapper(sharedState, dstFdDup);
+        if (!dir) {
+            spdlog::error("failed to open dst directory {}: {} ({})\n", remote,
+                          errno, strerror(errno));
+            return -1;
+        }
+
+#pragma omp taskgroup
+        {
+            struct dirent *d;
+            while ((d = readdir_wrapper(sharedState, dir))) {
+                if (faccessat(newSrcFD, d->d_name, F_OK, AT_SYMLINK_NOFOLLOW) <
+                    0) {
+                    StringPartRef newPathRef =
+                        toStringPart(globalAllocator, path, "/", 1, d->d_name,
+                                     strlen(d->d_name));
+#pragma omp task
+                    recursiveRemove(sharedState->destRootFD, newPathRef,
+                                    sharedState);
+                }
+            }
+        }
+
+        closedir_wrapper(sharedState, dir);
+    }
+
     DIR *dir = fdopendir_wrapper(sharedState, fd);
     if (!dir) {
         spdlog::error("failed to open directory {}: {} ({})\n", remote, errno,
@@ -974,11 +1000,7 @@ int processDir(StringPartRef path, std::optional<dev_t> dev,
         return -1;
     }
 
-    sharedState->filesSeen++;
-
-    sharedState->ndirs++;
-
-    // #pragma omp taskgroup
+#pragma omp taskgroup
     {
         struct dirent *d;
         while ((d = readdir_wrapper(sharedState, dir))) {
@@ -1092,13 +1114,11 @@ void finishProcessorOne(SharedState *sharedState, FileCopyJob &fileJob) {
         spdlog::error("{} failed with {} errors", fileJob, fileJob.nErrors);
         partialDeleted = fileJobSuccess = false;
     } else {
-        //         if (!isNullRef(fileJob.partial)) {
-        //             recursiveRemoveDirectory(
-        //                 STRING_PART_RC_INC(globalAllocator,
-        //                 fileJob.remote), sharedState,
-        //                 sharedState->destRootFD, 0, true);
-        // #pragma omp taskwait
-        //         }
+        if (!isNullRef(fileJob.partial)) {
+            recursiveRemove(sharedState->destRootFD,
+                            STRING_PART_RC_INC(globalAllocator, fileJob.remote),
+                            sharedState);
+        }
 
         struct timespec times[] = {
             {.tv_nsec = UTIME_OMIT},
@@ -1348,6 +1368,7 @@ int main(int argc, char *argv[]) {
     cli.add_option("dest", opts.dest, "path to transfer files to")
         ->required()
         ->check(CLI::ExistingDirectory);
+    cli.add_flag("--sync", opts.sync, "delete extra files on the destination");
     cli.validate_positionals();
 
     CLI11_PARSE(cli, argc, argv);

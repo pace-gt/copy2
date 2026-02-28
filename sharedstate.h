@@ -24,6 +24,8 @@ struct Opts {
 
     bool readback;
 
+    bool sync;
+
 #ifndef NDEBUG
     bool runTests;
 #endif
