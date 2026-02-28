@@ -1144,13 +1144,6 @@ void finishProcessorOne(SharedState *sharedState, FileCopyJob &fileJob) {
             spdlog::error("{} failed to set modification times : {} ", fileJob,
                           strerror(errno));
             fileJobSuccess = false;
-        } else if (!S_ISLNK(fileJob.stx.stx_mode) &&
-                   (destStx.stx_mode != fileJob.stx.stx_mode) &&
-                   fchmodat_wrapper(sharedState, dstFDGuard.fd(), dstRemoteName,
-                                    fileJob.stx.stx_mode, 0) < 0) {
-            spdlog::error("{} failed to set mode: {} ", fileJob,
-                          strerror(errno));
-            fileJobSuccess = false;
         } else if ((destStx.stx_uid != fileJob.stx.stx_uid ||
                     destStx.stx_gid != fileJob.stx.stx_gid) &&
                    fchownat_wrapper(sharedState, dstFDGuard.fd(), dstRemoteName,
@@ -1159,6 +1152,13 @@ void finishProcessorOne(SharedState *sharedState, FileCopyJob &fileJob) {
             spdlog::error("{} failed to chown: {} ", fileJob, strerror(errno));
             fileJobSuccess = false;
 
+        } else if (!S_ISLNK(fileJob.stx.stx_mode) &&
+                   (destStx.stx_mode != fileJob.stx.stx_mode) &&
+                   fchmodat_wrapper(sharedState, dstFDGuard.fd(), dstRemoteName,
+                                    fileJob.stx.stx_mode, 0) < 0) {
+            spdlog::error("{} failed to set mode: {} ", fileJob,
+                          strerror(errno));
+            fileJobSuccess = false;
         } else if (fileJob.stx.stx_nlink > 1) {
             size_t nFinishedInc = 0;
             hlinkStateHandleTransfer(
