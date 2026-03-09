@@ -595,7 +595,9 @@ int recursiveRemove(int dstfd, StringPartRef path, SharedState *sharedState,
 
     if (depth == 0 && unlinkat_wrapper(sharedState, dstfd, remote, 0) == 0) {
         return 0;
-    } else if (depth == 0 && errno != EISDIR && errno != ENOENT) {
+    } else if (depth == 0 && errno == ENOENT) {
+        return 0;
+    } else if (depth == 0 && errno != EISDIR) {
         spdlog::error(
             "recursiveRemove failed initial unlink pass on {} with error {}",
             remote, strerror(errno));
@@ -617,9 +619,14 @@ int recursiveRemove(int dstfd, StringPartRef path, SharedState *sharedState,
         return -1;
     }
 
+    auto tid = gettid();
 #pragma omp taskgroup
     {
+        assert(tid == gettid());
         struct dirent *d;
+
+        int x = 0;
+
         while ((d = readdir(dstdir))) {
             if (ISDOT(d->d_name))
                 continue;
@@ -628,20 +635,28 @@ int recursiveRemove(int dstfd, StringPartRef path, SharedState *sharedState,
                 globalAllocator, path, "/", 1, d->d_name, strlen(d->d_name));
 
             if (d->d_type == DT_DIR) {
-#pragma omp task
+#pragma omp task depend(in : x)
                 {
                     recursiveRemove(dstfd, newPathRef, sharedState, depth + 1);
                 }
             } else {
-#pragma omp task
+#pragma omp task depend(in : x)
                 {
                     recursiveRemoveNonDir(dstfd, newPathRef, sharedState);
                 }
             }
         }
+
+        // we use a data dependency to ensure the directory handle is closed
+        // before the above tasks run so we play nice with nfs
+#pragma omp task depend(out : x) if (false)
+        {
+            closedir_wrapper(
+                sharedState,
+                dstdir); // Barrier 2: Release the handle BEFORE unlinking.
+            x++;
+        }
     }
-    closedir_wrapper(sharedState,
-                     dstdir); // Barrier 2: Release the handle BEFORE unlinking.
     // Barrier 1: All files and sub-sub-dirs are definitely gone here.
 
     // child tasks could have overwritten the thread local buffer
@@ -934,6 +949,58 @@ int processDir(StringPartRef path, std::optional<dev_t> dev,
         return -1;
     }
 
+    if (sharedState->opts.sync) {
+        int dstFdDup = openat_wrapper(sharedState, dstFDGuard.fd(), name,
+                                      O_DIRECTORY | O_NOATIME, 0);
+        if (dstFdDup < 0) {
+            spdlog::error("processDir sync failed to open dst dir {}: {}({})",
+                          remote, errno, strerror(errno));
+            return -1;
+        }
+
+        if (dstFdDup < 0) {
+            spdlog::error("failed to duplicate dst fd for {}: {}", remote,
+                          strerror(errno));
+            return -1;
+        }
+
+        DIR *dir = fdopendir_wrapper(sharedState, dstFdDup);
+        if (!dir) {
+            spdlog::error("failed to open dst directory {}: {} ({})\n", remote,
+                          errno, strerror(errno));
+            return -1;
+        }
+
+        auto tid = gettid();
+#pragma omp taskgroup
+        {
+            assert(tid == gettid());
+            struct dirent *d;
+
+            int x = 0;
+
+            while ((d = readdir_wrapper(sharedState, dir))) {
+                if (faccessat(newSrcFD, d->d_name, F_OK, AT_SYMLINK_NOFOLLOW) <
+                    0) {
+                    StringPartRef newPathRef =
+                        toStringPart(globalAllocator, path, "/", 1, d->d_name,
+                                     strlen(d->d_name));
+#pragma omp task depend(in : x)
+                    recursiveRemove(sharedState->destRootFD, newPathRef,
+                                    sharedState);
+                }
+            }
+
+            // The data dependency hack, again to ensure directory modification
+            // happens after the dst dir fd closes
+#pragma omp task depend(out : x) if (false)
+            {
+                closedir_wrapper(sharedState, dir);
+                x++;
+            }
+        }
+    }
+
     int newDstFD = openat_wrapper(sharedState, dstFDGuard.fd(), name,
                                   O_DIRECTORY | O_NOATIME, 0);
     if (newDstFD < 0) {
@@ -957,42 +1024,6 @@ int processDir(StringPartRef path, std::optional<dev_t> dev,
 
     sharedState->ndirs++;
 
-    if (sharedState->opts.sync) {
-        sem_wait(&sharedState->fdSem);
-        int dstFdDup = dup(newDstFD);
-
-        if (dstFdDup < 0) {
-            spdlog::error("failed to duplicate dst fd for {}: {}", remote,
-                          strerror(errno));
-            return -1;
-        }
-
-        DIR *dir = fdopendir_wrapper(sharedState, dstFdDup);
-        if (!dir) {
-            spdlog::error("failed to open dst directory {}: {} ({})\n", remote,
-                          errno, strerror(errno));
-            return -1;
-        }
-
-#pragma omp taskgroup
-        {
-            struct dirent *d;
-            while ((d = readdir_wrapper(sharedState, dir))) {
-                if (faccessat(newSrcFD, d->d_name, F_OK, AT_SYMLINK_NOFOLLOW) <
-                    0) {
-                    StringPartRef newPathRef =
-                        toStringPart(globalAllocator, path, "/", 1, d->d_name,
-                                     strlen(d->d_name));
-#pragma omp task
-                    recursiveRemove(sharedState->destRootFD, newPathRef,
-                                    sharedState);
-                }
-            }
-        }
-
-        closedir_wrapper(sharedState, dir);
-    }
-
     DIR *dir = fdopendir_wrapper(sharedState, fd);
     if (!dir) {
         spdlog::error("failed to open directory {}: {} ({})\n", remote, errno,
@@ -1000,8 +1031,10 @@ int processDir(StringPartRef path, std::optional<dev_t> dev,
         return -1;
     }
 
+    auto tid = gettid();
 #pragma omp taskgroup
     {
+        assert(tid == gettid());
         struct dirent *d;
         while ((d = readdir_wrapper(sharedState, dir))) {
             if (ISDOT(d->d_name)) {
@@ -1291,6 +1324,8 @@ void incrementalLogger(SharedState *sharedState) {
             sharedState->ndirs = 0;
             sharedState->statms = 0;
             lastPrint = omp_get_wtime();
+
+            spdlog::default_logger()->flush();
         }
 
         std::this_thread::sleep_for(std::chrono::seconds(1));
