@@ -619,10 +619,8 @@ int recursiveRemove(int dstfd, StringPartRef path, SharedState *sharedState,
         return -1;
     }
 
-    auto tid = gettid();
 #pragma omp taskgroup
     {
-        assert(tid == gettid());
         struct dirent *d;
 
         int x = 0;
@@ -971,10 +969,8 @@ int processDir(StringPartRef path, std::optional<dev_t> dev,
             return -1;
         }
 
-        auto tid = gettid();
 #pragma omp taskgroup
         {
-            assert(tid == gettid());
             struct dirent *d;
 
             int x = 0;
@@ -1031,10 +1027,8 @@ int processDir(StringPartRef path, std::optional<dev_t> dev,
         return -1;
     }
 
-    auto tid = gettid();
 #pragma omp taskgroup
     {
-        assert(tid == gettid());
         struct dirent *d;
         while ((d = readdir_wrapper(sharedState, dir))) {
             if (ISDOT(d->d_name)) {
