@@ -75,7 +75,7 @@ void hlinkStateRegisterLinkRoot(struct SharedState *sharedState, HLinkState *sta
                                 size_t srcNLinksExpected,
                                 size_t destNLinksExpected, int destRootFD,
                                 bool *shouldTransfer, bool *isFirstLook,
-                                bool *isPendingHardlink);
+                                bool *isPendingHardlink, FDRCRef dstFDRef);
 
 void hlinkStateHandleTransfer(struct SharedState *sharedState,
                               const FileCopyJob &fileJob, HLinkState *state,

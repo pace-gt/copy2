@@ -9,7 +9,7 @@ Allocator *globalAllocator = NULL;
 Allocator *createAllocator(size_t memSize, size_t nSubAllocators,
                            size_t subAllocatorSize, size_t diskSize,
                            size_t copyBufferSize, const char *diskfilename) {
-    spdlog::info("logger is {}", (void*)spdlog::default_logger_raw());
+    // spdlog::info("logger is {}", (void*)spdlog::default_logger_raw());
 
     Allocator *alloc = NULL;
     buddy *memAlloc = NULL;

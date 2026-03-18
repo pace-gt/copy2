@@ -45,40 +45,7 @@
 #include <unistd.h>
 #include <utility>
 
-struct FDRCGuard {
-    std::string path;
-    FDRCRef fdrcRef;
-    SharedState *sharedState;
-    FDRCGuard(SharedState *sharedState, FDRCRef fdrc)
-        : fdrcRef(fdrc), sharedState(sharedState) {}
-
-    int fd() {
-        FDRC *fdrc = (FDRC *)allocDeref(globalAllocator, fdrcRef, sizeof(FDRC));
-        return fdrc->fd;
-    }
-
-    FDRCRef incref() {
-        FDRC *fdrc = (FDRC *)allocDeref(globalAllocator, fdrcRef, sizeof(FDRC));
-        fdrc->rc++;
-
-        return fdrcRef;
-    };
-
-    FDRC *deref() {
-        FDRC *fdrc = (FDRC *)allocDeref(globalAllocator, fdrcRef, sizeof(FDRC));
-        return fdrc;
-    }
-
-    ~FDRCGuard() {
-        FDRC *fdrc = (FDRC *)allocDeref(globalAllocator, fdrcRef, sizeof(FDRC));
-        size_t rc = fdrc->rc--;
-
-        if (rc == 1) {
-            close_wrapper(sharedState, fdrc->fd);
-            AllocatorFree(globalAllocator, fdrcRef);
-        }
-    }
-};
+#include "fdrcguard.h"
 
 #define INITIAL_READLINK_BUF_SIZE 512
 
@@ -391,6 +358,8 @@ inline void schedulerUpdateBlockCopyJob(CopyScheduler *sched,
 
         spdlog::error("{} aio request failed: {}", *blockJob,
                       strerror(blockJob->status));
+        fileJob->nBlockJobsFinished++;
+        fileJob->nBlockJobsScheduled--;
         schedulerClearBlockCopyJob(sched, sharedState, fileJob, blockJob);
     } else {
     }
@@ -759,7 +728,7 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev,
             sharedState, &sharedState->hlinkState, globalAllocator, remote,
             path, stx.stx_ino, destStx.stx_ino, exists, stx.stx_nlink,
             destStx.stx_nlink, sharedState->destRootFD, &shouldTransfer,
-            &isFirstLook, &isPendingHardlink);
+            &isFirstLook, &isPendingHardlink, dstFDGuard.fdrcRef);
         if (isPendingHardlink) {
             shouldTransfer = false;
         }
@@ -779,6 +748,8 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev,
     }
 
     if (shouldTransfer) {
+        // TODO: check return value to determine if mtime on the directory is
+        // necessary
         unlinkat_wrapper(sharedState, dstFDGuard.fd(), partialName, 0);
 
         if (S_ISREG(stx.stx_mode)) {
@@ -1011,10 +982,15 @@ int processDir(StringPartRef path, std::optional<dev_t> dev,
     FDRCGuard newSrcFDRefGuard(sharedState, newSrcFDRef);
     newSrcFDRefGuard.deref()->fd = newSrcFD;
     newSrcFDRefGuard.deref()->rc = 1;
+    newSrcFDRefGuard.deref()->path = STRING_PART_RC_INC(globalAllocator, path);
+    newSrcFDRefGuard.deref()->dst = 0;
 
     FDRCGuard newDstFDRefGuard(sharedState, newDstFDRef);
     newDstFDRefGuard.deref()->fd = newDstFD;
     newDstFDRefGuard.deref()->rc = 1;
+    newDstFDRefGuard.deref()->path = STRING_PART_RC_INC(globalAllocator, path);
+    newDstFDRefGuard.deref()->dst = true;
+    newDstFDRefGuard.deref()->srcStx = stx;
 
     sharedState->filesSeen++;
 
@@ -1044,13 +1020,13 @@ int processDir(StringPartRef path, std::optional<dev_t> dev,
                                  strlen(d->d_name));
 #pragma omp task
                 processDir(newPathRef, dev, newSrcFDRef,
-                           newDstFDRefGuard.incref(), sharedState);
+                           newDstFDRef, sharedState);
             } else {
                 StringPartRef newPathRef =
                     toStringPart(globalAllocator, path, "/", 1, d->d_name,
                                  strlen(d->d_name));
 #pragma omp task
-                processNonDir(newPathRef, dev, newSrcFDRefGuard.incref(),
+                processNonDir(newPathRef, dev, newSrcFDRef,
                               newDstFDRef, sharedState);
             }
         }
@@ -1058,15 +1034,15 @@ int processDir(StringPartRef path, std::optional<dev_t> dev,
 
     closedir_wrapper(sharedState, dir);
 
-    sharedState->finishQueue.enqueue({
-        .firstLook = true,
-        .remote = STRING_PART_RC_INC(globalAllocator, path),
-        .partial = {},
-        .stx = stx,
-        .srcFd = -1,
-        .dstFd = -1,
-        .dstDirFD = dstFDGuard.incref(),
-    });
+    // sharedState->finishQueue.enqueue({
+    //     .firstLook = true,
+    //     .remote = STRING_PART_RC_INC(globalAllocator, path),
+    //     .partial = {},
+    //     .stx = stx,
+    //     .srcFd = -1,
+    //     .dstFd = -1,
+    //     .dstDirFD = dstFDGuard.incref(),
+    // });
 
     return 0;
 }
@@ -1116,11 +1092,20 @@ void finishProcessorOne(SharedState *sharedState, FileCopyJob &fileJob) {
         dstFileName++;
     }
 
+    if (fileJob.isDot) {
+        assert(isNullRef(partial));
+        dstFileName = ".";
+    }
+
     const char *dstRemoteName = strrchr(remote, '/');
     if (!dstRemoteName) {
         dstRemoteName = remote;
     } else {
         dstRemoteName++;
+    }
+
+    if (fileJob.isDot) {
+        dstRemoteName = ".";
     }
 
     bool fileJobSuccess = true;
@@ -1129,8 +1114,8 @@ void finishProcessorOne(SharedState *sharedState, FileCopyJob &fileJob) {
     struct statx destStx = {};
     if (statx_wrapper(sharedState, dstFDGuard.fd(), dstFileName,
                       AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &destStx) < 0) {
-        spdlog::error("{} failed to stat destination: {} ", fileJob,
-                      strerror(errno));
+        spdlog::error("{} failed to stat destination: {}, name={} ", fileJob,
+                      strerror(errno), dstFileName);
         partialDeleted = fileJobSuccess = false;
     } else if (S_ISREG(fileJob.stx.stx_mode) &&
                destStx.stx_size != fileJob.stx.stx_size) {
@@ -1349,7 +1334,7 @@ int main(int argc, char *argv[]) {
     cli.add_option("--allocator-disk-size", opts.allocatorDiskSize,
                    "the size of the allocator's disk backed file")
         ->transform(CLI::AsSizeValue(false))
-        ->default_val("1TB");
+        ->default_val("0B");
     cli.add_option("--crawlers", opts.nCrawlers, "number of crawler threads")
         ->default_val(16);
     cli.add_option("--transfers", opts.nTransfers, "number of transfer threads")
@@ -1398,7 +1383,7 @@ int main(int argc, char *argv[]) {
         ->required()
         ->check(CLI::ExistingDirectory);
     cli.add_flag("--sync", opts.sync, "delete extra files on the destination");
-    cli.validate_positionals();
+    // cli.validate_positionals();
 
     CLI11_PARSE(cli, argc, argv);
 
@@ -1505,21 +1490,27 @@ int main(int argc, char *argv[]) {
     sharedState->destRootFD = destRootFD;
     sharedState->srcRootFD = srcRootFD;
 
+    StringPartRef rootRef =
+        toStringPart(globalAllocator, {}, ".", 1, nullptr, 0);
+
     FDRCRef srcRootFDRef = AllocatorAllocate(globalAllocator, sizeof(FDRC));
     FDRCRef dstRootFDRef = AllocatorAllocate(globalAllocator, sizeof(FDRC));
 
     FDRCGuard srcRootFDRefGuard(sharedState, srcRootFDRef);
     srcRootFDRefGuard.deref()->fd = srcRootFD;
     srcRootFDRefGuard.deref()->rc = 1;
+    srcRootFDRefGuard.deref()->path =
+        STRING_PART_RC_INC(globalAllocator, rootRef);
+    srcRootFDRefGuard.deref()->dst = false;
 
     FDRCGuard dstRootFDRefGuard(sharedState, dstRootFDRef);
     dstRootFDRefGuard.deref()->fd = destRootFD;
     dstRootFDRefGuard.deref()->rc = 1;
+    dstRootFDRefGuard.deref()->path =
+        STRING_PART_RC_INC(globalAllocator, rootRef);
+    dstRootFDRefGuard.deref()->dst = false;
 
-    StringPartRef rootRef =
-        toStringPart(globalAllocator, {}, ".", 1, nullptr, 0);
-
-    spdlog::info("logger is {}", (void *)spdlog::default_logger_raw());
+    // spdlog::info("logger is {}", (void *)spdlog::default_logger_raw());
 
     int ret = 0;
 #pragma omp parallel sections

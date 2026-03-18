@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fcntl.h>
+#include <linux/stat.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 
@@ -175,10 +176,22 @@ StringPartRef toStringPart(Allocator *alloc, StringPartRef currentTip,
                            const char *s1, size_t len1, const char *s2,
                            size_t len2);
 
+struct FDRC {
+    std::atomic_size_t rc;
+    int fd;
+
+    StringPartRef path;
+    bool dst;
+
+    statx srcStx; // only relevant if dst is true
+};
+
+typedef AllocRef FDRCRef;
 typedef AllocRef LinkEntryRef;
 struct LinkEntry {
     StringPartRef link;
     LinkEntryRef prev;
+    FDRCRef dstFDRef;
 };
 
 inline LinkEntryRef linkEntryAppend(Allocator *alloc, LinkEntryRef tip,
@@ -197,9 +210,3 @@ inline LinkEntryRef linkEntryAppend(Allocator *alloc, LinkEntryRef tip,
 void *buddy_base_ptr(buddy *bdy);
 
 extern Allocator *globalAllocator;
-
-struct FDRC {
-    std::atomic_size_t rc;
-    int fd;
-};
-typedef AllocRef FDRCRef;

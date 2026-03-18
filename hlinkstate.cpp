@@ -1,5 +1,6 @@
 #include "hlinkstate.h"
 #include "allocator.h"
+#include "fdrcguard.h"
 #include "filejob.h"
 #include "gtl/phmap.hpp"
 #include "logging.h"
@@ -158,7 +159,7 @@ void hlinkStateRegisterLinkRoot(SharedState *sharedState, HLinkState *state,
                                 size_t srcNLinksExpected,
                                 size_t destNLinksExpected, int destRootFD,
                                 bool *shouldTransfer, bool *isFirstLook,
-                                bool *isPendingHardlink) {
+                                bool *isPendingHardlink, FDRCRef dstFDRef) {
 
     bool origShouldTransfer = *shouldTransfer;
 reroll:
@@ -256,8 +257,15 @@ reroll:
                 LinkEntryRef entryRef =
                     AllocatorAllocate(alloc, sizeof(LinkEntry));
 
-                ((LinkEntry *)allocDeref(alloc, entryRef, sizeof(LinkEntry)))
-                    ->link = STRING_PART_RC_INC(alloc, remoteRef);
+                LinkEntry *entry = ((LinkEntry *)allocDeref(alloc, entryRef,
+                                                            sizeof(LinkEntry)));
+
+                FDRC *dstFD =
+                    (FDRC *)allocDeref(globalAllocator, dstFDRef, sizeof(FDRC));
+                dstFD->rc++;
+
+                entry->link = STRING_PART_RC_INC(alloc, remoteRef);
+                entry->dstFDRef = dstFDRef;
 
                 hinfo->links = linkEntryAppend(alloc, hinfo->links, entryRef);
 
@@ -476,6 +484,8 @@ void hlinkStateHandleTransfer(SharedState *sharedState,
         while (!isNullRef(curRef)) {
             LinkEntry *entry =
                 (LinkEntry *)allocDeref(alloc, curRef, sizeof(LinkEntry));
+
+            FDRCGuard dstFDGuard(sharedState, entry->dstFDRef);
 
             thread_local size_t linkRootBufSize = 4096;
             thread_local AllocRef linkRootBuf =

@@ -37,6 +37,7 @@ struct FileCopyJob {
     size_t nBlockJobsFinished;
     size_t nErrors;
 
+    bool isDot; // hacky, means this fd is the actual file
     FDRCRef dstDirFD;
 };
 
