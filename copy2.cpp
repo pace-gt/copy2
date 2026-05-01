@@ -47,6 +47,15 @@
 
 #include "fdrcguard.h"
 
+bool isZero(const char *const data, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        if (data[i])
+            return false;
+    }
+
+    return true;
+}
+
 #define INITIAL_READLINK_BUF_SIZE 512
 
 #define ISDOT(a) (a[0] == '.' && (!a[1] || (a[1] == '.' && !a[2])))
@@ -286,6 +295,14 @@ inline void schedulerUpdateBlockCopyJob(CopyScheduler *sched,
                                         BlockCopyJob *blockJob) {
     if (blockJob->status == 0) {
         if (blockJob->type == READ) {
+            if (sharedState->opts.sparse &&
+                isZero((const char *const)blockJob->data, blockJob->nbytes)) {
+                blockJob->type = WRITE;
+                blockJob->status = 0;
+                sharedState->bytesRead += blockJob->nbytes;
+                return;
+            }
+
             sharedState->bytesRead += blockJob->nbytes;
 
             io_prep_pwrite(&blockJob->cb, blockJob->parent->dstFd,
@@ -716,9 +733,20 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev,
     sharedState->filesSeen++;
 
     shouldTransfer = !exists;
-    shouldTransfer |= memcmp(&stx.stx_mtime, &destStx.stx_mtime,
-                             sizeof(stx.stx_mtime)) != 0 ||
+
+    if (shouldTransfer) {
+        spdlog::trace("transferring {} as it doesn't exist on the destination",
+                      remote);
+    }
+
+    shouldTransfer |= stx.stx_mtime.tv_sec != destStx.stx_mtime.tv_sec ||
                       stx.stx_size != destStx.stx_size;
+
+    if (exists && shouldTransfer) {
+        spdlog::trace("transferring {} mtime {} vs {}, size {} vs {}", remote,
+                      stx.stx_mtime.tv_sec, destStx.stx_mtime.tv_sec,
+                      stx.stx_size, destStx.stx_size);
+    }
 
     bool isPendingHardlink = false;
     bool isFirstLook = false;
@@ -1019,15 +1047,15 @@ int processDir(StringPartRef path, std::optional<dev_t> dev,
                     toStringPart(globalAllocator, path, "/", 1, d->d_name,
                                  strlen(d->d_name));
 #pragma omp task
-                processDir(newPathRef, dev, newSrcFDRef,
-                           newDstFDRef, sharedState);
+                processDir(newPathRef, dev, newSrcFDRef, newDstFDRef,
+                           sharedState);
             } else {
                 StringPartRef newPathRef =
                     toStringPart(globalAllocator, path, "/", 1, d->d_name,
                                  strlen(d->d_name));
 #pragma omp task
-                processNonDir(newPathRef, dev, newSrcFDRef,
-                              newDstFDRef, sharedState);
+                processNonDir(newPathRef, dev, newSrcFDRef, newDstFDRef,
+                              sharedState);
             }
         }
     }
@@ -1093,7 +1121,7 @@ void finishProcessorOne(SharedState *sharedState, FileCopyJob &fileJob) {
     }
 
     if (fileJob.isDot) {
-        assert(isNullRef(partial));
+        assert(isNullRef(fileJob.partial));
         dstFileName = ".";
     }
 
@@ -1383,6 +1411,9 @@ int main(int argc, char *argv[]) {
         ->required()
         ->check(CLI::ExistingDirectory);
     cli.add_flag("--sync", opts.sync, "delete extra files on the destination");
+    cli.add_flag(
+        "--sparse", opts.sparse,
+        "don't write sparse blocks to destination to maintain sparseness");
     // cli.validate_positionals();
 
     CLI11_PARSE(cli, argc, argv);
@@ -1479,9 +1510,12 @@ int main(int argc, char *argv[]) {
 
     for (size_t i = 0; i < nScheds; i++) {
         CopyScheduler &sched = scheds[i];
-        if (createScheduler(&sched, 2048, 16)) {
+        if (createScheduler(&sched, 2048, 256)) {
             exit(1);
         }
+        // if (createScheduler(&sched, 512, 128)) {
+        //     exit(1);
+        // }
     }
 
     sharedState->scheds = scheds;

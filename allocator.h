@@ -15,7 +15,9 @@
 #define ALLOC_MAX_ARENA_SIZE UINT32_MAX
 #define ALLOC_ARENA_SIZE ALLOC_MAX_ARENA_SIZE
 
+#ifndef NDEBUG
 #define ALLOC_DEBUG
+#endif
 
 static_assert(ALLOC_ARENA_SIZE <= ALLOC_MAX_ARENA_SIZE,
               "allocator arena size cannot exceed UINT32_MAX for "

@@ -23,7 +23,7 @@ struct Opts {
     size_t maxFDs;
 
     bool readback;
-
+    bool sparse;
     bool sync;
 
 #ifndef NDEBUG
