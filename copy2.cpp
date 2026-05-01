@@ -171,6 +171,8 @@ int createScheduler(CopyScheduler *sched, size_t nFileCopyJobs,
         .cbBatchSize = 0,
     };
 
+    spdlog::info("attempting to create {} jobs",
+                 nFileCopyJobs * nBlockCopyJobsPerFileCopyJob);
     int ret;
     if ((ret = io_queue_init(nFileCopyJobs * nBlockCopyJobsPerFileCopyJob,
                              &sched->ctx))) {
@@ -1278,27 +1280,29 @@ void incrementalLogger(SharedState *sharedState) {
                         : (size_t)((double)sharedState->bytesWritten.load() /
                                    delta)});
 
-            spdlog::info("\tjobqueue: size={}, enqueuesem={}",
-                         sharedState->jobQueue.size_approx(),
-                         sharedState->jobQueue.enqueueSem->get_value());
-            spdlog::info("\tfinishQueue: size={}, enqueuesem={}",
-                         sharedState->finishQueue.size_approx(),
-                         sharedState->finishQueue.enqueueSem->get_value());
+            if (sharedState->opts.extraStats) {
+                spdlog::info("\tjobqueue: size={}, enqueuesem={}",
+                             sharedState->jobQueue.size_approx(),
+                             sharedState->jobQueue.enqueueSem->get_value());
+                spdlog::info("\tfinishQueue: size={}, enqueuesem={}",
+                             sharedState->finishQueue.size_approx(),
+                             sharedState->finishQueue.enqueueSem->get_value());
 
-            spdlog::info("\tallocation failures {}/{}",
-                         sharedState->allocationFailures.load(),
-                         sharedState->allocationAttempts.load());
-            spdlog::info("\tqueue left {}",
-                         sharedState->jobQueue.size_approx());
-            spdlog::info("\ttotal allocated {}KB",
-                         sharedState->totalMemAllocated.load() / 1024);
-            spdlog::info("\tscheduler iterations {}",
-                         sharedState->schedulerIterations.load());
-            int val;
-            sem_getvalue(&sharedState->fdSem, &val);
-            spdlog::info("\tfdsem: {}", val);
-            spdlog::info("\tndirs: {}", sharedState->ndirs.load());
-            spdlog::info("\tstat time: {}ms", sharedState->statms.load());
+                spdlog::info("\tallocation failures {}/{}",
+                             sharedState->allocationFailures.load(),
+                             sharedState->allocationAttempts.load());
+                spdlog::info("\tqueue left {}",
+                             sharedState->jobQueue.size_approx());
+                spdlog::info("\ttotal allocated {}KB",
+                             sharedState->totalMemAllocated.load() / 1024);
+                spdlog::info("\tscheduler iterations {}",
+                             sharedState->schedulerIterations.load());
+                int val;
+                sem_getvalue(&sharedState->fdSem, &val);
+                spdlog::info("\tfdsem: {}", val);
+                spdlog::info("\tndirs: {}", sharedState->ndirs.load());
+                spdlog::info("\tstat time: {}ms", sharedState->statms.load());
+            }
 
             // for (int i = 0; i < nScheds; i++) {
             //     size_t nFActive = 0;
@@ -1367,6 +1371,12 @@ int main(int argc, char *argv[]) {
         ->default_val(16);
     cli.add_option("--transfers", opts.nTransfers, "number of transfer threads")
         ->default_val(8);
+    cli.add_option("--file-copy-jobs", opts.nFileCopyJobs,
+                   "number of file copy jobs per thread")
+        ->default_val(128);
+    cli.add_option("--block-copy-jobs", opts.nBlockCopyJobs,
+                   "number of block copy jobs per thread")
+        ->default_val(32);
     cli.add_option("--finish-processors", opts.nFinishProcessors,
                    "number of finish processor threads")
         ->default_val(16);
@@ -1414,11 +1424,13 @@ int main(int argc, char *argv[]) {
     cli.add_flag(
         "--sparse", opts.sparse,
         "don't write sparse blocks to destination to maintain sparseness");
+    cli.add_flag("--extra-stats", opts.extraStats,
+                 "enable the printing of internal statistics");
     // cli.validate_positionals();
 
     CLI11_PARSE(cli, argc, argv);
 
-    mkdir(opts.dataDir.c_str(), 0744);
+    mkdir(opts.dataDir.c_str(), 0755);
 
     auto err_logger = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();
     err_logger->set_level(spdlog::level::info);
@@ -1510,7 +1522,7 @@ int main(int argc, char *argv[]) {
 
     for (size_t i = 0; i < nScheds; i++) {
         CopyScheduler &sched = scheds[i];
-        if (createScheduler(&sched, 2048, 256)) {
+        if (createScheduler(&sched, opts.nFileCopyJobs, opts.nBlockCopyJobs)) {
             exit(1);
         }
         // if (createScheduler(&sched, 512, 128)) {

@@ -14,6 +14,7 @@ struct Opts {
     size_t threadMemSize;
 
     size_t nCrawlers, nTransfers, nFinishProcessors;
+    size_t nFileCopyJobs, nBlockCopyJobs;
 
     size_t copyBufferSize;
     size_t minBlockSize, maxBlockSize;
@@ -25,6 +26,8 @@ struct Opts {
     bool readback;
     bool sparse;
     bool sync;
+
+    bool extraStats;
 
 #ifndef NDEBUG
     bool runTests;
