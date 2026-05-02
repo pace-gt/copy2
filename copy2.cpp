@@ -1396,9 +1396,6 @@ int main(int argc, char *argv[]) {
     cli.add_option("--mem-per-thread", opts.threadMemSize, "Memory per thread")
         ->transform(CLI::AsSizeValue(false))
         ->default_val("256KB");
-    cli.add_option("--readback", opts.readback,
-                   "should we read transferred blocks back and run checksums?")
-        ->default_val(false);
     cli.add_option("--hlink-cache-members", opts.hlinkMemCacheMembers,
                    "number of hardlink entries to store in ram before "
                    "writing to disk")
@@ -1424,6 +1421,8 @@ int main(int argc, char *argv[]) {
     cli.add_flag(
         "--sparse", opts.sparse,
         "don't write sparse blocks to destination to maintain sparseness");
+    cli.add_flag("--readback", opts.readback,
+                 "should we read transferred blocks back and run checksums?");
     cli.add_flag("--extra-stats", opts.extraStats,
                  "enable the printing of internal statistics");
     // cli.validate_positionals();
