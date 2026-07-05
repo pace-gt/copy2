@@ -211,7 +211,11 @@ void schedIOSubmitDeferred(CopyScheduler *sched, iocb *cb) {
 
 int schedIOSubmitBatch(CopyScheduler *sched, SharedState *sharedState) {
     if (sched->cbBatchSize) {
-        if (io_submit(sched->ctx, sched->cbBatchSize, sched->cbBatch) < 0) {
+        int submitted =
+            io_submit(sched->ctx, sched->cbBatchSize, sched->cbBatch);
+
+        if (submitted < 0) {
+            // io_submit failed before queueing anything: fail the whole batch.
             for (size_t i = 0; i < sched->cbBatchSize; i++) {
                 BlockCopyJob *blockJob =
                     (BlockCopyJob *)((uint8_t *)sched->cbBatch[i] -
@@ -219,7 +223,7 @@ int schedIOSubmitBatch(CopyScheduler *sched, SharedState *sharedState) {
                 FileCopyJob *fileJob = blockJob->parent;
 
                 spdlog::error("{} failed to queue aio request {}", *blockJob,
-                              strerror(errno));
+                              strerror(-submitted));
 
                 schedulerClearBlockCopyJob(sched, sharedState, fileJob,
                                            blockJob);
@@ -231,6 +235,15 @@ int schedIOSubmitBatch(CopyScheduler *sched, SharedState *sharedState) {
 
             return -1;
         }
+
+        size_t remaining = sched->cbBatchSize - (size_t)submitted;
+        if (remaining) {
+            memmove(sched->cbBatch, sched->cbBatch + submitted,
+                    remaining * sizeof(*sched->cbBatch));
+        }
+        sched->cbBatchSize = remaining;
+
+        return 0;
     }
 
     sched->cbBatchSize = 0;
@@ -288,7 +301,7 @@ inline void schedulerScheduleBlockCopyJob(CopyScheduler *sched,
 
     schedIOSubmitDeferred(sched, &blockJob->cb);
 
-    blockJob->jobno = fileJob->nBlockJobsScheduled++;
+    fileJob->nBlockJobsScheduled++;
 }
 
 inline void schedulerUpdateBlockCopyJob(CopyScheduler *sched,
@@ -299,9 +312,9 @@ inline void schedulerUpdateBlockCopyJob(CopyScheduler *sched,
         if (blockJob->type == READ) {
             if (sharedState->opts.sparse &&
                 isZero((const char *const)blockJob->data, blockJob->nbytes)) {
-                blockJob->type = WRITE;
-                blockJob->status = 0;
                 sharedState->bytesRead += blockJob->nbytes;
+                blockJob->type = FINISH;
+                blockJob->status = 0;
                 return;
             }
 
