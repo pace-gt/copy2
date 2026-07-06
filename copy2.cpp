@@ -557,6 +557,13 @@ int schedulerUpdate(CopyScheduler *sched, SharedState *sharedState,
 
     return EINPROGRESS;
 }
+typedef AllocRef DirEntRef;
+struct DirEnt {
+    StringPartRef path;
+    DirEntRef prev;
+    bool isDir;
+};
+
 int recursiveRemoveNonDir(int dstfd, StringPartRef path,
                           SharedState *sharedState) {
 
@@ -620,11 +627,9 @@ int recursiveRemove(int dstfd, StringPartRef path, SharedState *sharedState,
         return -1;
     }
 
-#pragma omp taskgroup
+    DirEntRef entries = {};
     {
         struct dirent *d;
-
-        int x = 0;
 
         while ((d = readdir(dstdir))) {
             if (ISDOT(d->d_name))
@@ -633,30 +638,42 @@ int recursiveRemove(int dstfd, StringPartRef path, SharedState *sharedState,
             StringPartRef newPathRef = toStringPart(
                 globalAllocator, path, "/", 1, d->d_name, strlen(d->d_name));
 
-            if (d->d_type == DT_DIR) {
-#pragma omp task depend(in : x)
+            DirEntRef nodeRef =
+                AllocatorAllocate(globalAllocator, sizeof(DirEnt));
+            DirEnt *node =
+                (DirEnt *)allocDeref(globalAllocator, nodeRef, sizeof(DirEnt));
+            node->path = newPathRef;
+            node->isDir = (d->d_type == DT_DIR);
+            node->prev = entries;
+            entries = nodeRef;
+        }
+    }
+    closedir_wrapper(sharedState, dstdir);
+
+#pragma omp taskgroup
+    {
+        for (DirEntRef it = entries; !isNullRef(it);) {
+            DirEnt *node =
+                (DirEnt *)allocDeref(globalAllocator, it, sizeof(DirEnt));
+            StringPartRef newPathRef = node->path;
+            bool isDir = node->isDir;
+            DirEntRef next = node->prev;
+            AllocatorFree(globalAllocator, it);
+            it = next;
+
+            if (isDir) {
+#pragma omp task
                 {
                     recursiveRemove(dstfd, newPathRef, sharedState, depth + 1);
                 }
             } else {
-#pragma omp task depend(in : x)
+#pragma omp task
                 {
                     recursiveRemoveNonDir(dstfd, newPathRef, sharedState);
                 }
             }
         }
-
-        // we use a data dependency to ensure the directory handle is closed
-        // before the above tasks run so we play nice with nfs
-#pragma omp task depend(out : x) if (false)
-        {
-            closedir_wrapper(
-                sharedState,
-                dstdir); // Barrier 2: Release the handle BEFORE unlinking.
-            x++;
-        }
     }
-    // Barrier 1: All files and sub-sub-dirs are definitely gone here.
 
     // child tasks could have overwritten the thread local buffer
     // this is terrible behavior, but such is the price we pay
@@ -983,11 +1000,13 @@ int processDir(StringPartRef path, std::optional<dev_t> dev,
             return -1;
         }
 
-#pragma omp taskgroup
+        // Snapshot the dst-only entries into a linked list first, close the
+        // handle, then prune. Removing while the stream is open races readdir
+        // and, on NFS, leaves silly-renamed .nfs* files behind (same hazard as
+        // recursiveRemove).
+        DirEntRef toRemove = {};
         {
             struct dirent *d;
-
-            int x = 0;
 
             while ((d = readdir_wrapper(sharedState, dir))) {
                 if (faccessat(newSrcFD, d->d_name, F_OK, AT_SYMLINK_NOFOLLOW) <
@@ -995,18 +1014,34 @@ int processDir(StringPartRef path, std::optional<dev_t> dev,
                     StringPartRef newPathRef =
                         toStringPart(globalAllocator, path, "/", 1, d->d_name,
                                      strlen(d->d_name));
-#pragma omp task depend(in : x)
-                    recursiveRemove(sharedState->destRootFD, newPathRef,
-                                    sharedState);
+
+                    DirEntRef nodeRef =
+                        AllocatorAllocate(globalAllocator, sizeof(DirEnt));
+                    DirEnt *node = (DirEnt *)allocDeref(globalAllocator, nodeRef,
+                                                        sizeof(DirEnt));
+                    node->path = newPathRef;
+                    node->isDir = true;
+                    node->prev = toRemove;
+                    toRemove = nodeRef;
                 }
             }
+        }
+        // Release the handle BEFORE unlinking any entries.
+        closedir_wrapper(sharedState, dir);
 
-            // The data dependency hack, again to ensure directory modification
-            // happens after the dst dir fd closes
-#pragma omp task depend(out : x) if (false)
-            {
-                closedir_wrapper(sharedState, dir);
-                x++;
+#pragma omp taskgroup
+        {
+            for (DirEntRef it = toRemove; !isNullRef(it);) {
+                DirEnt *node =
+                    (DirEnt *)allocDeref(globalAllocator, it, sizeof(DirEnt));
+                StringPartRef newPathRef = node->path;
+                DirEntRef next = node->prev;
+                AllocatorFree(globalAllocator, it);
+                it = next;
+
+#pragma omp task
+                recursiveRemove(sharedState->destRootFD, newPathRef,
+                                sharedState);
             }
         }
     }
