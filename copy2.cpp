@@ -1473,6 +1473,12 @@ int main(int argc, char *argv[]) {
                  "should we read transferred blocks back and run checksums?");
     cli.add_flag("--extra-stats", opts.extraStats,
                  "enable the printing of internal statistics");
+    cli.add_option("--log-level", opts.logLevel,
+                   "verbosity of the data-dir log file: "
+                   "trace|debug|info|warn|error|critical|off")
+        ->check(CLI::IsMember({"trace", "debug", "info", "warn", "error",
+                               "critical", "off"}))
+        ->default_val("info");
     // cli.validate_positionals();
 
     CLI11_PARSE(cli, argc, argv);
@@ -1483,14 +1489,20 @@ int main(int argc, char *argv[]) {
     err_logger->set_level(spdlog::level::info);
     // spdlog::cfg::load_env_levels();
 
+    // File-log verbosity is configurable (default info). At the old hardcoded
+    // trace level this sink wrote ~11 lines per file copied and flushed on every
+    // message, which dominated write traffic (and CPU) for small-file trees.
+    auto fileLevel = spdlog::level::from_str(opts.logLevel);
+
     double starttime = omp_get_wtime();
     auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
         fmt::format("{}/copy2-{}.log", opts.dataDir, starttime), true);
-    file_sink->set_level(spdlog::level::trace);
+    file_sink->set_level(fileLevel);
 
     auto logger = std::make_shared<spdlog::logger>(
         spdlog::logger("copy2", {err_logger, file_sink}));
-    logger->set_level(spdlog::level::trace);
+    // Let through whatever the most verbose sink needs (stderr is info).
+    logger->set_level(std::min(fileLevel, spdlog::level::info));
     spdlog::register_logger(logger);
     spdlog::set_default_logger(logger);
 
@@ -1499,7 +1511,9 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    logger->flush_on(spdlog::level::trace);
+    // Flush on warnings/errors only; per-message flushing at trace was a large
+    // hidden cost. Buffered lines are flushed on exit.
+    logger->flush_on(spdlog::level::warn);
 
     const char *root = opts.src.c_str();
     const char *dest = opts.dest.c_str();

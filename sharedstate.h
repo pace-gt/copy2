@@ -29,6 +29,8 @@ struct Opts {
 
     bool extraStats;
 
+    std::string logLevel = "info";
+
 #ifndef NDEBUG
     bool runTests;
 #endif
