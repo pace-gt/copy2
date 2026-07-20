@@ -1,0 +1,17 @@
+ts,bench,variant,tool,nfiles,filesize_bytes,conc,wall_s,peak_pss_mb,peak_rss_mb,rc,mem_method
+2026-07-20T05:22:22-06:00,crawling,crawl,copy2,1000000,2048,cr16/tr4/fp8,7.11,61.1,64.7,0,sampler
+2026-07-20T05:23:34-06:00,crawling,crawl,rsync,1000000,2048,1,64.423,9.3,25.2,0,sampler
+2026-07-20T05:23:50-06:00,crawling,crawl,rclone,1000000,2048,ck128/tr32,9.592,154.9,156.6,0,sampler
+2026-07-20T05:25:00-06:00,crawling,crawl,fpsync,1000000,2048,16,62.843,18.9,121.7,0,sampler
+2026-07-20T05:26:00-06:00,metadata,metadata,copy2,1000000,2048,cr16/tr4/fp8,8.783,64.3,67.7,0,sampler
+2026-07-20T05:27:16-06:00,metadata,metadata,rsync,1000000,2048,1,56.171,9.6,25.3,0,sampler
+2026-07-20T05:27:41-06:00,metadata,metadata,rclone,1000000,2048,ck128/tr32,9.563,160.4,162.2,0,sampler
+2026-07-20T05:28:50-06:00,metadata,metadata,fpsync,1000000,2048,16,50.832,20.1,139.7,0,sampler
+2026-07-20T05:29:24-06:00,hardlinks,hardlinks,copy2,1000000,2048,cr16/tr4/fp8,10.136,84.4,88.0,0,sampler
+2026-07-20T05:29:47-06:00,hardlinks,hardlinks,rsync,1000000,2048,1,11.744,22.2,38.1,0,sampler
+2026-07-20T05:30:56-06:00,hardlinks,hardlinks,rclone,1000000,2048,ck128/tr32,58.842,132.9,134.6,0,sampler
+2026-07-20T05:31:49-06:00,hardlinks,hardlinks,fpsync,1000000,2048,16,23.197,46.1,340.4,0,sampler
+2026-07-20T05:33:08-06:00,transfer,transfer,copy2,1000000,2048,cr16/tr4/fp8,36.13,70.3,73.7,0,sampler
+2026-07-20T05:34:36-06:00,transfer,transfer,rsync,1000000,2048,1,57.433,11.6,27.5,0,sampler
+2026-07-20T05:36:01-06:00,transfer,transfer,rclone,1000000,2048,ck128/tr32,58.139,137.0,138.7,0,sampler
+2026-07-20T05:37:15-06:00,transfer,transfer,fpsync,1000000,2048,16,39.929,42.6,309.6,0,sampler
