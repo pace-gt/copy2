@@ -113,6 +113,7 @@ Allocator *createAllocator(size_t memSize, size_t nSubAllocators,
 AllocRef AllocatorAllocate(Allocator *alloc, size_t len);
 AllocRef AllocatorAllocateRange(Allocator *alloc, size_t start, size_t len);
 void AllocatorFree(Allocator *alloc, AllocRef ref);
+void allocatorReportLeaks();
 
 // const size_t STRING_PART_MAX_LEN = 64 - sizeof(AllocRef) - 1;
 typedef AllocRef StringPartRef;

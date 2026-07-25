@@ -18,6 +18,10 @@ inline size_t blockCount(size_t fsize, size_t blockSize) {
     return (fsize / blockSize) + (size_t)((fsize % blockSize) > 0);
 }
 
+inline size_t alignUp(size_t n, size_t align) {
+    return (n + align - 1) & ~(align - 1);
+}
+
 struct FileCopyJob {
     bool active;
     bool firstLook;

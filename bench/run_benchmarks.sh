@@ -64,6 +64,12 @@
 #   run_benchmarks.sh --mem-method cgroup        # exact peaks (needs sudo here)
 #   run_benchmarks.sh --drop-caches              # cold caches (sync+drop 2) per run
 #   run_benchmarks.sh --drop-caches 3            # drop pagecache+dentries+inodes
+#   run_benchmarks.sh --reset-jobs 32             # parallel destination cleanup
+#
+# Empty destinations: never rm a million-file tree on the critical path between
+# tools. Rename the old dst aside (O(1) on the same FS) and delete it in the
+# background while the next measured run proceeds. Metadata resets still need a
+# parallel chmod walk (modes must change in place).
 #
 set -uo pipefail
 
@@ -80,6 +86,7 @@ SCALE="${SCALE:-1000000}"        # file count for the 1e6-class datasets
 INTERVAL="${INTERVAL:-0.05}"     # memsample interval (s)
 MEM_METHOD="${MEM_METHOD:-sampler}"   # sampler | cgroup
 DROP_CACHES="${DROP_CACHES:-}"   # if set (e.g. 2) sync+drop caches before each run
+RESET_JOBS="${RESET_JOBS:-}"     # empty -> CONC after argument parsing
 GENERATE=0
 ENABLE_1TB=0
 ONLY=""
@@ -135,7 +142,7 @@ FPSYNC_CHUNK="${FPSYNC_CHUNK:-}"        # empty -> not passed
 # rsync don't verify, so this keeps the comparison fair.
 COPY2_OPTS="${COPY2_OPTS:-}"
 RSYNC_OPTS="${RSYNC_OPTS:--a}"
-RCLONE_OPTS="${RCLONE_OPTS:---stats 0 --ignore-checksum}"
+RCLONE_OPTS="${RCLONE_OPTS:---stats 0 --ignore-checksum -M}"
 FPSYNC_RSYNC_OPTS="${FPSYNC_RSYNC_OPTS:--lptgoD}"
 
 # ---- arg parsing ----------------------------------------------------------
@@ -175,6 +182,7 @@ while [[ $# -gt 0 ]]; do
         --mem-method)   MEM_METHOD="$2"; shift ;;
         --drop-caches)  DROP_CACHES=2
                         [[ "${2:-}" =~ ^[123]$ ]] && { DROP_CACHES="$2"; shift; } ;;
+        --reset-jobs)   RESET_JOBS="$2"; shift ;;
         --interval)     INTERVAL="$2"; shift ;;
         -h|--help)      grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -189,6 +197,10 @@ COPY2_TRANSFERS="${COPY2_TRANSFERS:-$COPY2_CONC}"
 COPY2_FINISHERS="${COPY2_FINISHERS:-$COPY2_CONC}"
 RCLONE_CHECKERS="${RCLONE_CHECKERS:-$RCLONE_CONC}"
 RCLONE_TRANSFERS="${RCLONE_TRANSFERS:-$RCLONE_CONC}"
+RESET_JOBS="${RESET_JOBS:-$CONC}"
+
+[[ "$RESET_JOBS" =~ ^[1-9][0-9]*$ ]] ||
+    { echo "--reset-jobs must be a positive integer" >&2; exit 2; }
 
 [[ -z "$COPY2" || ! -x "$COPY2" ]] && { echo "copy2 binary not found (set COPY2=)" >&2; exit 1; }
 mkdir -p "$DATA_ROOT" "$WORK"
@@ -242,30 +254,135 @@ record() {  # record bench variant tool nfiles size conc
 }
 
 # ---- dst reset helpers ----------------------------------------------------
+# Retired destination/scratch trees are renamed aside (O(1) on the same FS) and
+# their paths queued here; NOTHING is deleted until the whole suite is done.
+# Deleting in the background used to overlap the next measured run, so a
+# million-file `rm` stole IO/CPU from the tool being timed and skewed results.
+# We now defer every delete to the very end (see cleanup_deferred_trash), at the
+# cost of holding the retired trees on disk until then.
+DEFERRED_TRASH=()
+
+rm_tree_parallel() {  # rm_tree_parallel DIR  -- parallel shard delete, then rmdir
+    local tree="$1"
+    [[ -e "$tree" ]] || return 0
+    # Delete directory shards independently. Batch non-directories so the flat
+    # benchmark does not launch one rm process for each of its million files.
+    find "$tree" -mindepth 1 -maxdepth 1 -type d -print0 |
+        xargs -0 -r -n 1 -P "$RESET_JOBS" rm -rf --
+    find "$tree" -mindepth 1 -maxdepth 1 ! -type d -print0 |
+        xargs -0 -r -n 4096 -P "$RESET_JOBS" rm -f --
+    rm -rf -- "$tree"
+}
+
+# Delete everything queued by defer_dst_trash/defer_misc_rm. Called once at the
+# end of the suite (and from the EXIT trap so an interrupted run still cleans
+# up). Trees are deleted concurrently since nothing is being measured anymore.
+cleanup_deferred_trash() {
+    [[ ${#DEFERRED_TRASH[@]} -gt 0 ]] || return 0
+    local trees=("${DEFERRED_TRASH[@]}")
+    DEFERRED_TRASH=()   # clear first so the EXIT trap is idempotent
+    local t0 t1 pids=() tree
+    t0=$(date +%s.%N)
+    for tree in "${trees[@]}"; do
+        [[ -e "$tree" ]] || continue
+        rm_tree_parallel "$tree" &
+        pids+=($!)
+    done
+    local pid
+    for pid in "${pids[@]+"${pids[@]}"}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    t1=$(date +%s.%N)
+    printf "  [cleanup] deferred_rm trees=%s wall=%.3fs\n" "${#trees[@]}" \
+        "$(awk -v a="$t0" -v b="$t1" 'BEGIN{print b-a}')"
+}
+
+defer_dst_trash() {  # defer_dst_trash DIR -- queue a retired dst for end-of-run rm
+    local tree="$1"
+    [[ -e "$tree" ]] || return 0
+    DEFERRED_TRASH+=("$tree")
+}
+
+defer_misc_rm() {  # defer_misc_rm DIR -- queue scratch cleanup for end-of-run rm
+    local tree="$1"
+    [[ -e "$tree" ]] || return 0
+    DEFERRED_TRASH+=("$tree")
+}
+
+# Sweep leftover dst.__trash.* from crashed runs (queued for end-of-run rm).
+reap_stale_trash() {  # reap_stale_trash DATASET_ROOT
+    local trash
+    shopt -s nullglob
+    for trash in "$1"/dst.__trash.*; do
+        defer_misc_rm "$trash"
+    done
+    shopt -u nullglob
+}
+
 reset_empty() {  # reset_empty DSTDIR
-    rm -rf "$1"; mkdir -p "$1"
+    # Critical path must stay O(1): rename the old tree aside and mkdir a fresh
+    # empty dst. The renamed tree is queued and its million-file delete is
+    # deferred to the very end of the suite (cleanup_deferred_trash) so no `rm`
+    # ever overlaps a measured run.
+    local dst="$1" parent trash t0 t1
+    parent="$(dirname "$dst")"
+    mkdir -p "$parent"
+    t0=$(date +%s.%N)
+    if [[ -e "$dst" ]]; then
+        trash="$dst.__trash.$$.$RANDOM"
+        mv -- "$dst" "$trash"
+        defer_dst_trash "$trash"
+    fi
+    mkdir -p "$dst"
+    t1=$(date +%s.%N)
+    printf "  [setup] reset_empty (rename+defer) wall=%.3fs\n" \
+        "$(awk -v a="$t0" -v b="$t1" 'BEGIN{print b-a}')"
 }
+
 reset_perms() {  # reset_perms DSTDIR  -> re-diverge modes so metadata fix reruns
-    find "$1" -type f -exec chmod 600 {} + 2>/dev/null
+    local t0 t1
+    # Modes must change in place, so this remains a walk — parallelize it.
+    t0=$(date +%s.%N)
+    find "$1" -type f -print0 |
+        xargs -0 -r -n 4096 -P "$RESET_JOBS" chmod 600 --
+    t1=$(date +%s.%N)
+    printf "  [setup] reset_perms jobs=%s wall=%.3fs\n" "$RESET_JOBS" \
+        "$(awk -v a="$t0" -v b="$t1" 'BEGIN{print b-a}')"
 }
+
 fresh_datadir() {  # echo a clean copy2 --data-dir
     local d="$WORK/copy2-data"
-    rm -rf "$d"; mkdir -p "$d"; echo "$d"
+    if [[ -e "$d" ]]; then
+        local trash="$d.__trash.$$.$RANDOM"
+        mv -- "$d" "$trash"
+        defer_misc_rm "$trash"
+    fi
+    mkdir -p "$d"; echo "$d"
 }
+
+trap 'cleanup_deferred_trash' EXIT
 
 # Flush the page/dentry/inode caches so each run starts cold. Needs root, so
 # this calls sudo. In the real target environment sudo is passwordless, so it
 # just runs; on a box that requires a password, -A uses $SUDO_ASKPASS to prompt
 # (a no-op when no password is needed). sudo caches the credential, so you are
 # only prompted when its timestamp has expired.
-drop_caches() {
+drop_caches() {  # drop_caches PATH_ON_BENCHMARK_FILESYSTEM
     [[ -n "$DROP_CACHES" ]] || return 0
-    sync
+    local t0 t1
+    # A bare `sync` flushes every mounted filesystem on the node and can spend
+    # minutes waiting for unrelated cluster storage. syncfs(2), exposed by
+    # `sync -f`, flushes only the filesystem used by this benchmark.
+    t0=$(date +%s.%N)
+    sync -f "$1"
     if [[ "$(id -u)" == 0 ]]; then
         echo "$DROP_CACHES" > /proc/sys/vm/drop_caches
     else
         sudo -A sh -c "echo $DROP_CACHES > /proc/sys/vm/drop_caches"
     fi
+    t1=$(date +%s.%N)
+    printf "  [setup] drop_caches=%s wall=%.3fs\n" "$DROP_CACHES" \
+        "$(awk -v a="$t0" -v b="$t1" 'BEGIN{print b-a}')"
 }
 
 # ---- per-tool command builders --------------------------------------------
@@ -277,6 +394,7 @@ build_cmd() {  # build_cmd TOOL SRC DST VARIANT  -> sets CMD array
         copy2)
             local dd; dd="$(fresh_datadir)"
             CMD=("$COPY2" --data-dir "$dd" --crawlers "$COPY2_CRAWLERS"
+                 --file-copy-jobs=2048 --block-copy-jobs=256 --extra-stats
                  --transfers "$COPY2_TRANSFERS" --finish-processors "$COPY2_FINISHERS"
                  --max-block-size "$COPY2_BLOCK")
             [[ -n "$COPY2_BUFFER" ]] && CMD+=(--copy-buffer-size "$COPY2_BUFFER")
@@ -331,6 +449,7 @@ run_one() {  # run_one BENCH VARIANT DATASET NFILES SIZE RESETKIND
     local src="$ds/src" dst="$ds/dst"
     [[ -d "$src" ]] || { echo "  (skip $bench: dataset $ds missing; use --generate)"; return; }
     echo "[$bench] dataset=$ds nfiles=$nfiles"
+    reap_stale_trash "$ds"
     for tool in copy2 rsync rclone fpsync; do
         have_tool "$tool" || continue
         tool_bin_ok "$tool" || { echo "  (skip $tool: not installed)"; continue; }
@@ -340,7 +459,7 @@ run_one() {  # run_one BENCH VARIANT DATASET NFILES SIZE RESETKIND
             none)  : ;;
         esac
         build_cmd "$tool" "$src" "$dst" "$variant"
-        drop_caches
+        drop_caches "$dst"
         measure "$bench/$tool" -- "${CMD[@]}"
         record "$bench" "$variant" "$tool" "$nfiles" "$size" "$(tool_conc "$tool")"
     done
@@ -407,5 +526,10 @@ if want_bench transfer_1tb; then
         echo "[transfer_1tb] defined but skipped (pass --enable-1tb to run)"
     fi
 fi
+
+# All measured runs are over: now do the deferred million-file deletes we have
+# been queuing so they never contended with a timed tool.
+echo "== cleaning up deferred deletions =="
+cleanup_deferred_trash
 
 echo "== done -> $RESULTS =="

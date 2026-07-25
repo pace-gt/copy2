@@ -47,6 +47,8 @@
 
 #include "fdrcguard.h"
 
+static constexpr size_t DIRECT_IO_ALIGN = 4096;
+
 bool isZero(const char *const data, size_t len) {
     for (size_t i = 0; i < len; i++) {
         if (data[i])
@@ -320,8 +322,17 @@ inline void schedulerUpdateBlockCopyJob(CopyScheduler *sched,
 
             sharedState->bytesRead += blockJob->nbytes;
 
+            // O_DIRECT writes must be alignment-multiples. The trailing partial
+            // block is the only unaligned case: round its length up to the
+            // alignment and zero the padding so we never write stale heap bytes.
+            size_t writeBytes = alignUp(blockJob->nbytes, DIRECT_IO_ALIGN);
+            if (writeBytes > blockJob->nbytes) {
+                memset((char *)blockJob->data + blockJob->nbytes, 0,
+                       writeBytes - blockJob->nbytes);
+            }
+
             io_prep_pwrite(&blockJob->cb, blockJob->parent->dstFd,
-                           blockJob->data, blockJob->nbytes, blockJob->offset);
+                           blockJob->data, writeBytes, blockJob->offset);
             // iocb *cbp = &blockJob->cb;
             blockJob->status = EINPROGRESS;
             blockJob->type = WRITE;
@@ -837,7 +848,8 @@ int processNonDir(StringPartRef path, std::optional<dev_t> dev,
     close_wrapper(sharedState, srcFd);                                         \
     close_wrapper(sharedState, dstFd)
 
-            if (ftruncate_wrapper(sharedState, dstFd, stx.stx_size) < 0) {
+            if (ftruncate_wrapper(sharedState, dstFd,
+                                  alignUp(stx.stx_size, DIRECT_IO_ALIGN)) < 0) {
                 spdlog::error("failed to ftruncate {}: {}", remote,
                               strerror(errno));
                 CLEAN;
@@ -1131,6 +1143,15 @@ void finishProcessorOne(SharedState *sharedState, FileCopyJob &fileJob) {
     }
 
     if (fileJob.dstFd >= 0) {
+        if (S_ISREG(fileJob.stx.stx_mode) &&
+            ftruncate_wrapper(sharedState, fileJob.dstFd, fileJob.stx.stx_size) <
+                0) {
+            spdlog::error("{} failed to truncate dst to final size {}: {}",
+                          fileJob, (size_t)fileJob.stx.stx_size,
+                          strerror(errno));
+            fileJob.nErrors++;
+        }
+
         close_wrapper(sharedState, fileJob.dstFd);
     }
 
@@ -1533,6 +1554,23 @@ int main(int argc, char *argv[]) {
 
     spdlog::info("copying files from {} to {}", opts.src, opts.dest);
 
+    size_t nAllocThreads =
+        opts.nFinishProcessors + opts.nCrawlers + opts.nTransfers;
+    size_t subAllocTotal = nAllocThreads * opts.threadMemSize;
+    if (opts.allocatorMemSize <= opts.copyBufferSize + subAllocTotal) {
+        spdlog::error(
+            "--allocator-mem-size ({}) must exceed --copy-buffer-size ({}) + "
+            "--mem-per-thread ({}) x {} threads ({}) = {}; raise "
+            "--allocator-mem-size or lower --copy-buffer-size, "
+            "--mem-per-thread, or the crawler/transfer/finisher counts",
+            bytesize::bytesize{opts.allocatorMemSize},
+            bytesize::bytesize{opts.copyBufferSize},
+            bytesize::bytesize{opts.threadMemSize}, nAllocThreads,
+            bytesize::bytesize{subAllocTotal},
+            bytesize::bytesize{opts.copyBufferSize + subAllocTotal});
+        return 1;
+    }
+
     size_t arena_size = opts.copyBufferSize;
     globalAllocator = createAllocator(
         opts.allocatorMemSize,
@@ -1548,10 +1586,8 @@ int main(int argc, char *argv[]) {
     sharedState->opts = opts;
     sharedState->logger = logger;
 
-    sharedState->jobQueue =
-        Queue(std::min((size_t)60000, sharedState->opts.maxFDs));
-    sharedState->finishQueue =
-        Queue(std::min((size_t)60000, sharedState->opts.maxFDs));
+    sharedState->jobQueue = Queue(sharedState->opts.maxFDs);
+    sharedState->finishQueue = Queue(sharedState->opts.maxFDs);
 
     // pthread_rwlock_init(&sharedState->hlinkState.lock, NULL);
     createHLinkState(
@@ -1670,6 +1706,8 @@ int main(int argc, char *argv[]) {
 
     spdlog::info("copying finished in {}s",
                  (size_t)(omp_get_wtime() - starttime));
+
+    allocatorReportLeaks();
 
     spdlog::shutdown();
 

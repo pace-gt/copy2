@@ -47,9 +47,20 @@ export WORK=/scratch/$USER/copy2-bench-work
 python3 plot.py --csv results.csv --outdir plots
 ```
 
-`--drop-caches N` runs `sync; echo N > /proc/sys/vm/drop_caches` before every
-run (`1`=pagecache, `2`=dentries/inodes, `3`=both — use **3** for a truly cold
-comparison). Omit it to run warm.
+`--drop-caches N` flushes the filesystem containing the current destination,
+then writes `N` to `/proc/sys/vm/drop_caches` before every run
+(`1`=pagecache, `2`=dentries/inodes, `3`=both — use **3** for a truly cold
+comparison). The filesystem-scoped flush avoids waiting for unrelated mounts
+on a shared node. Omit the flag to run warm.
+
+Empty destinations are reset by renaming the old tree aside (O(1) on the same
+FS) and queuing it; the actual million-file `rm` is **deferred to the very end
+of the suite** rather than run in the background during the next measured run,
+so deletion IO/CPU never contends with a timed tool. The trade-off is that every
+retired destination is kept on disk until the suite finishes — size `DATA_ROOT`
+accordingly (see the cluster notes). Metadata resets still chmod in place, but
+that walk is parallel. `--reset-jobs N` controls cleanup/chmod concurrency and
+defaults to `--conc`.
 
 ## Selecting a subset
 
@@ -99,7 +110,11 @@ benches ran) `mem_scaling.png`.
 
 - Point `DATA_ROOT`/`WORK` at the real target filesystem — that's what you're
   actually benchmarking. `WORK` needs room for copy2's data-dir and fpsync's
-  part queue; `DATA_ROOT` holds src+dst (≈ 2× the transferred bytes).
+  part queue; `DATA_ROOT` holds src+dst plus every retired dst tree, since
+  deletions are now deferred to the end of the suite (one retired dst per
+  tool/bench beyond the first). Budget for the peak accordingly — with N tools
+  it can approach src + N×dst for the largest bench before the final cleanup
+  runs.
 - The optimal concurrency is **hardware-specific**. On the single-NVMe dev box
   copy2 preferred *low* transfer concurrency (4) and high crawlers (16); on a
   parallel/networked FS it will want far more transfer concurrency. Re-sweep

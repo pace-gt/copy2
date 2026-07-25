@@ -88,12 +88,73 @@ def _sample(root):
     return pss, rss
 
 
+def _categorize(path, size_kb):
+    """Bucket a mapping into an attribution category.
+
+    copy2's whole allocator is a single large anonymous mmap, so its resident
+    footprint shows up as one >=1G anonymous mapping -- this cleanly separates
+    "copy2 arena resident" from glibc arenas, thread stacks, and libraries.
+    """
+    if path:
+        if path.startswith("[stack"):
+            return "main-stack"
+        if path == "[heap]":
+            return "glibc-heap"
+        if path.startswith("[anon"):
+            return f"named-anon {path}"
+        if path.endswith(".so") or ".so." in path or "/lib" in path:
+            return "shared-libs"
+        if path.endswith("/copy2") or path.endswith("copy2"):
+            return "binary"
+        if path.endswith(".db") or "hlstate" in path or path.endswith("lock"):
+            return "lmdb"
+        return f"file {os.path.basename(path)}"
+    # anonymous
+    if size_kb >= 1024 * 1024:
+        return "copy2-arena (anon>=1G)"
+    if size_kb >= 16 * 1024:
+        return "big-anon 16M-1G (glibc arena?)"
+    if 8 * 1024 - 128 <= size_kb <= 8 * 1024 + 128:
+        return "thread-stack (~8M)"
+    return "small-anon (<16M)"
+
+
+def _smaps_breakdown(pids):
+    """Return {category: rss_kb} summed over the given pids' /proc/*/smaps."""
+    cats = {}
+    hdr = None  # (path, size_kb)
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/smaps", "rb") as f:
+                path, size_kb = None, 0
+                for line in f:
+                    # mapping header: "addr-addr perms off dev inode  path"
+                    if b"-" in line[:20] and b" " in line and line[0:1] != b" ":
+                        parts = line.split()
+                        if len(parts) >= 5 and b"-" in parts[0]:
+                            lo, hi = parts[0].split(b"-")
+                            size_kb = (int(hi, 16) - int(lo, 16)) // 1024
+                            path = (parts[5].decode("utf-8", "replace")
+                                    if len(parts) >= 6 else None)
+                            continue
+                    if line.startswith(b"Rss:"):
+                        rss = int(line.split()[1])
+                        if rss:
+                            c = _categorize(path, size_kb)
+                            cats[c] = cats.get(c, 0) + rss
+        except (OSError, ValueError, IndexError):
+            continue
+    return cats
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--interval", type=float, default=0.05,
                     help="sample interval in seconds (default 0.05)")
     ap.add_argument("--json", help="write a JSON result record to this path")
     ap.add_argument("--label", default="", help="free-form label for the record")
+    ap.add_argument("--smaps", action="store_true",
+                    help="capture a per-mapping RSS attribution at peak RSS")
     ap.add_argument("cmd", nargs=argparse.REMAINDER,
                     help="-- followed by the command to run")
     args = ap.parse_args()
@@ -109,12 +170,16 @@ def main():
     proc = subprocess.Popen(cmd, start_new_session=True)
 
     peak_pss = peak_rss = 0
+    peak_breakdown = {}
     try:
         while True:
             rc = proc.poll()
             pss, rss = _sample(proc.pid)
             peak_pss = max(peak_pss, pss)
-            peak_rss = max(peak_rss, rss)
+            if rss > peak_rss:
+                peak_rss = rss
+                if args.smaps:
+                    peak_breakdown = _smaps_breakdown(_subtree_pids(proc.pid))
             if rc is not None:
                 break
             time.sleep(args.interval)
@@ -148,6 +213,14 @@ def main():
     print(f"[memsample] {args.label or ' '.join(cmd)}: "
           f"wall={record['wall_s']}s peak_pss={record['peak_pss_mb']}MB "
           f"peak_rss={record['peak_rss_mb']}MB rc={rc}", file=sys.stderr)
+
+    if args.smaps and peak_breakdown:
+        total = sum(peak_breakdown.values()) or 1
+        print(f"[smaps] RSS attribution at peak ({peak_rss // 1024}MB total, "
+              f"subtree):", file=sys.stderr)
+        for cat, kb in sorted(peak_breakdown.items(), key=lambda kv: -kv[1]):
+            print(f"[smaps]   {kb/1024.0:8.1f}MB {100.0*kb/total:5.1f}%  {cat}",
+                  file=sys.stderr)
 
     return rc
 

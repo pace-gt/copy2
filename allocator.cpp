@@ -6,6 +6,18 @@
 
 Allocator *globalAllocator = NULL;
 
+#ifdef ALLOC_DEBUG
+std::atomic<int64_t> g_allocLive{0};
+std::atomic<int64_t> g_allocTotal{0};
+#endif
+
+void allocatorReportLeaks() {
+#ifdef ALLOC_DEBUG
+    spdlog::info("[alloc-leak] live={} total_allocs={}", g_allocLive.load(),
+                 g_allocTotal.load());
+#endif
+}
+
 Allocator *createAllocator(size_t memSize, size_t nSubAllocators,
                            size_t subAllocatorSize, size_t diskSize,
                            size_t copyBufferSize, const char *diskfilename) {
@@ -23,10 +35,33 @@ Allocator *createAllocator(size_t memSize, size_t nSubAllocators,
             exit(1);
         }
 
+#ifdef MADV_NOHUGEPAGE
+        madvise(mem, memSize, MADV_NOHUGEPAGE);
+#endif
+
         if (copyBufferSize < memSize) {
             copyBuffer = mem;
             mem = (uint8_t *)mem + copyBufferSize;
             memSize -= copyBufferSize;
+        }
+
+        unsigned char *subBase = NULL;
+        size_t subRegionSize = nSubAllocators * subAllocatorSize;
+        if (subRegionSize && subRegionSize < memSize) {
+            subBase = (unsigned char *)mem;
+            mem = (uint8_t *)mem + subRegionSize;
+            memSize -= subRegionSize;
+
+            for (size_t i = 0; i < nSubAllocators; i++) {
+                buddy *suballoc = buddy_embed_alignment(
+                    subBase + i * subAllocatorSize, subAllocatorSize, 128);
+                if (!suballoc) {
+                    spdlog::error("Failed to embed suballocator!");
+                    exit(1);
+                }
+            }
+        } else {
+            nSubAllocators = 0;
         }
 
         memAlloc = buddy_embed_alignment((uint8_t *)mem, memSize, 128);
@@ -36,32 +71,17 @@ Allocator *createAllocator(size_t memSize, size_t nSubAllocators,
             exit(1);
         }
 
-        for (size_t i = 0; i < nSubAllocators; i++) {
-            void *ptr = buddy_calloc(memAlloc, 1, subAllocatorSize);
-            if (!ptr) {
-                spdlog::error("Failed to allocate suballocator!");
-                exit(1);
-            }
-
-            buddy *suballoc = buddy_embed_alignment((unsigned char *)ptr,
-                                                    subAllocatorSize, 128);
-            if (!suballoc) {
-                spdlog::error("Failed to embed suballocator!");
-                exit(1);
-            }
-        }
-
         alloc = (Allocator *)buddy_calloc(memAlloc, 1, sizeof(Allocator));
 
         if (alloc) {
             alloc->memAlloc = memAlloc;
         }
 
-        alloc->memBase = (unsigned char *)mem;
+        alloc->memBase = subBase;
         alloc->nSubAllocators = nSubAllocators;
         alloc->subAllocatorSize = subAllocatorSize;
         alloc->subAllocatorLocks = (spinlock *)buddy_calloc(
-            memAlloc, nSubAllocators, sizeof(spinlock));
+            memAlloc, nSubAllocators ? nSubAllocators : 1, sizeof(spinlock));
     }
 
     if (diskSize) {
@@ -123,9 +143,6 @@ Allocator *createAllocator(size_t memSize, size_t nSubAllocators,
 }
 
 AllocRef AllocatorAllocate(Allocator *alloc, size_t len) {
-    void *val = calloc(len, 1);
-    return *(AllocRef *)&val;
-
     assert(len);
     assert(alloc);
 
@@ -174,6 +191,10 @@ AllocRef AllocatorAllocate(Allocator *alloc, size_t len) {
 #endif
 
     assert(allocation);
+#ifdef ALLOC_DEBUG
+    g_allocLive.fetch_add(1, std::memory_order_relaxed);
+    g_allocTotal.fetch_add(1, std::memory_order_relaxed);
+#endif
     return {
         .ptr = allocation,
 #ifdef ALLOC_DEBUG
@@ -231,6 +252,10 @@ AllocRef AllocatorAllocateRange(Allocator *alloc, size_t offset, size_t len) {
     alloc->lock.unlock();
 
     assert(allocation);
+#ifdef ALLOC_DEBUG
+    g_allocLive.fetch_add(1, std::memory_order_relaxed);
+    g_allocTotal.fetch_add(1, std::memory_order_relaxed);
+#endif
     return {
         .ptr = allocation,
 #ifdef ALLOC_DEBUG
@@ -241,8 +266,9 @@ AllocRef AllocatorAllocateRange(Allocator *alloc, size_t offset, size_t len) {
 
 void AllocatorFree(Allocator *alloc, AllocRef ref) {
     void *ptr = allocDeref(alloc, ref);
-    free(ptr);
-    return;
+#ifdef ALLOC_DEBUG
+    g_allocLive.fetch_sub(1, std::memory_order_relaxed);
+#endif
 
     if (alloc->nSubAllocators && ptr >= alloc->memBase) {
         size_t allocIndex =
@@ -251,7 +277,9 @@ void AllocatorFree(Allocator *alloc, AllocRef ref) {
         if (allocIndex < alloc->nSubAllocators) {
             alloc->subAllocatorLocks[allocIndex].lock();
             buddy *suballoc = buddy_get_embed_at_alignment(
-                (unsigned char *)alloc->memBase, alloc->subAllocatorSize, 128);
+                (unsigned char *)alloc->memBase +
+                    allocIndex * alloc->subAllocatorSize,
+                alloc->subAllocatorSize, 128);
 
 #ifdef ALLOC_DEBUG
             buddy_safe_free_status status = buddy_safe_free(

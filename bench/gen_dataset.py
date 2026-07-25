@@ -214,7 +214,7 @@ PROFILES = {
     "crawl":        (1_000_000, 2 * 1024,     "identical"),
     "metadata":     (1_000_000, 2 * 1024,     "perms"),
     "hardlinks":    (1_000_000, 2 * 1024,     "empty"),
-    "transfer":     (1_000_000, 2 * 1024,     "empty"),
+    "transfer":     (1_000_000, 2 * 1024 * 1024,     "empty"),
     "transfer_1tb": (1_000,     1024 ** 3,    "empty"),
     "flat":         (1_000_000, 2 * 1024,     "empty"),  # single directory
     "deep":         (50_000,    2 * 1024,     "empty"),  # deep + long paths
@@ -240,7 +240,7 @@ def main():
     ap.add_argument("--count", type=int, help="override file/link count")
     ap.add_argument("--size", type=int, help="override file size in bytes")
     ap.add_argument("--fanout", type=int, default=256, help="files per leaf dir")
-    ap.add_argument("--links-per-inode", type=int, default=10,
+    ap.add_argument("--links-per-inode", type=int, default=3,
                     help="hardlinks profile: links sharing each inode")
     ap.add_argument("--dst", choices=["empty", "identical", "perms", "none"],
                     help="override the profile's default dst state")
