@@ -64,6 +64,16 @@ struct Queue {
         return res;
     }
 
+    inline bool try_dequeue(FileCopyJob &item) {
+        bool res = q.try_dequeue(item);
+
+        if (res) {
+            enqueueSem->signal();
+        }
+
+        return res;
+    }
+
     size_t size_approx() { return q.size_approx(); }
 };
 

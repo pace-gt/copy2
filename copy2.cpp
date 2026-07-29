@@ -532,30 +532,29 @@ int schedulerUpdate(CopyScheduler *sched, SharedState *sharedState,
         }
     }
 
+    size_t activeJobs = 0;
+    for (size_t i = 0; i < sched->nFileCopyJobs; i++) {
+        activeJobs += (size_t)(sched->fileCopyJobs[i].active);
+    }
+
     // schedule new jobs
-    size_t activeJobs = 0; // this is not an accurate counter
     for (size_t i = 0; i < sched->nFileCopyJobs; i++) {
         FileCopyJob newJob;
         if (!sched->fileCopyJobs[i].active) {
-            if (jobQueue.wait_dequeue_timed(newJob, 100000)) {
+            bool got = (activeJobs > 0)
+                           ? jobQueue.try_dequeue(newJob)
+                           : jobQueue.wait_dequeue_timed(newJob, 100000);
+            if (got) {
                 sched->fileCopyJobs[i] = newJob;
                 sched->fileCopyJobs[i].nBlockJobsScheduled = 0;
                 sched->fileCopyJobs[i].nBlockJobsFinished = 0;
                 sched->fileCopyJobs[i].nErrors = 0;
                 sched->fileCopyJobs[i].active = true;
-                // activeJobs++;
-
-                // break;
+                activeJobs++;
             } else {
                 break;
             }
-        } else {
-            // activeJobs++;
         }
-    }
-
-    for (size_t i = 0; i < sched->nFileCopyJobs; i++) {
-        activeJobs += (size_t)(sched->fileCopyJobs[i].active);
     }
 
     sharedState->schedulerIterations++;

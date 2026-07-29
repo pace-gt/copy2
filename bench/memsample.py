@@ -24,10 +24,45 @@ Usage:
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
+
+
+_PWR_RE_AVG = re.compile(rb"Average power reading over sample period:\s+(\d+)")
+_PWR_RE_INST = re.compile(rb"Instantaneous power reading:\s+(\d+)")
+
+
+def read_power_watts(retries=4, timeout=25):
+    """Read node power (watts) from the BMC via DCMI, or None on failure.
+
+    `ipmitool dcmi power reading` reports WATTS (there is no cumulative joule
+    counter on this BMC), so energy is derived as watts*time by the caller. We
+    prefer the BMC's own "Average power reading over sample period" (a ~5s
+    rolling mean) over the instantaneous value to smooth out sub-second spikes.
+    Runs via `sudo -n` (passwordless on the compute nodes).
+
+    Under heavy I/O the BMC query can be slow or transiently fail, so we retry a
+    few times (with a short backoff) and use a generous timeout before giving up
+    and returning None (which degrades power accounting to blank for that run).
+    """
+    for attempt in range(retries):
+        try:
+            r = subprocess.run(
+                ["sudo", "-n", "ipmitool", "dcmi", "power", "reading"],
+                capture_output=True, timeout=timeout)
+            m = _PWR_RE_AVG.search(r.stdout) or _PWR_RE_INST.search(r.stdout)
+            if m:
+                return float(m.group(1))
+        except subprocess.TimeoutExpired:
+            pass
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if attempt < retries - 1:
+            time.sleep(1.0)
+    return None
 
 
 def _read_int_field(path, field):
@@ -155,6 +190,9 @@ def main():
     ap.add_argument("--label", default="", help="free-form label for the record")
     ap.add_argument("--smaps", action="store_true",
                     help="capture a per-mapping RSS attribution at peak RSS")
+    ap.add_argument("--power", action="store_true",
+                    help="record node energy via BMC power (watts) x wall time: "
+                         "reads power at start and finish, energy = mean*wall")
     ap.add_argument("cmd", nargs=argparse.REMAINDER,
                     help="-- followed by the command to run")
     args = ap.parse_args()
@@ -168,6 +206,8 @@ def main():
     start = time.monotonic()
     # New session so a stray tree can be signalled as a group if needed.
     proc = subprocess.Popen(cmd, start_new_session=True)
+    # Power at the start of the window (concurrent with the tool's warm-up).
+    pwr_start = read_power_watts() if args.power else None
 
     peak_pss = peak_rss = 0
     peak_breakdown = {}
@@ -191,6 +231,8 @@ def main():
         proc.wait()
         raise
 
+    # Power at the finish of the window (just after the tool exits).
+    pwr_end = read_power_watts() if args.power else None
     wall = time.monotonic() - start
     rc = proc.returncode
 
@@ -206,13 +248,28 @@ def main():
         "interval_s": args.interval,
     }
 
+    if args.power:
+        # No cumulative-energy register on this BMC (DCMI reports watts), so
+        # energy = mean(start,end power) * wall. Whichever endpoint is available
+        # is used; energy stays blank only if both reads failed.
+        vals = [w for w in (pwr_start, pwr_end) if w is not None]
+        avg_w = (sum(vals) / len(vals)) if vals else None
+        record["power_start_w"] = pwr_start
+        record["power_end_w"] = pwr_end
+        record["avg_watts"] = round(avg_w, 1) if avg_w is not None else None
+        record["energy_j"] = round(avg_w * wall, 1) if avg_w is not None else None
+
     if args.json:
         with open(args.json, "w") as f:
             json.dump(record, f)
 
+    pwr_msg = ""
+    if args.power:
+        pwr_msg = (f" energy={record.get('energy_j')}J "
+                   f"avg_watts={record.get('avg_watts')}")
     print(f"[memsample] {args.label or ' '.join(cmd)}: "
           f"wall={record['wall_s']}s peak_pss={record['peak_pss_mb']}MB "
-          f"peak_rss={record['peak_rss_mb']}MB rc={rc}", file=sys.stderr)
+          f"peak_rss={record['peak_rss_mb']}MB{pwr_msg} rc={rc}", file=sys.stderr)
 
     if args.smaps and peak_breakdown:
         total = sum(peak_breakdown.values()) or 1
