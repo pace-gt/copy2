@@ -655,8 +655,8 @@ run_incr_sweep() {
     # semantics); with an identical dst there are no extras to delete.
     COPY2_OPTS="$saved_opts --sync"
     RESET_IMMEDIATE=0   # keep the mirror; reset_mtime10 only shifts, never deletes
-    for i in "${!SIZE_SWEEP_BYTES[@]}"; do
-        tag="${SIZE_SWEEP_TAGS[$i]}"; bytes="${SIZE_SWEEP_BYTES[$i]}"
+    for i in "${!INCR_SWEEP_BYTES[@]}"; do
+        tag="${INCR_SWEEP_TAGS[$i]}"; bytes="${INCR_SWEEP_BYTES[$i]}"
         ds="$DATA_ROOT/incr_$tag"
         echo "== [incr_sweep] $tag: $INCR_SWEEP_COUNT files x ${bytes}B, identical dst, 10% mtime-shifted =="
         gen transfer "$ds" --count "$INCR_SWEEP_COUNT" --size "$bytes" \
@@ -703,6 +703,11 @@ BIG_SWEEP_SKIP="${BIG_SWEEP_SKIP-rsync}"
 # 2x the point size; the 64MB point is ~12.8TiB, still < free). rsync excluded.
 INCR_SWEEP_COUNT="${INCR_SWEEP_COUNT:-$SIZE_SWEEP_COUNT}"
 INCR_SWEEP_SKIP="${INCR_SWEEP_SKIP-rsync}"
+# The incr sweep's size points default to the full size sweep, but can be
+# restricted (e.g. to fit disk at high file counts) via space-separated env
+# lists INCR_SWEEP_BYTES_LIST / INCR_SWEEP_TAGS_LIST (must be 1:1).
+INCR_SWEEP_BYTES=(${INCR_SWEEP_BYTES_LIST:-${SIZE_SWEEP_BYTES[@]}})
+INCR_SWEEP_TAGS=(${INCR_SWEEP_TAGS_LIST:-${SIZE_SWEEP_TAGS[@]}})
 
 # 5d mem_deep: a per-path-storage sweep. File COUNT and per-file SIZE are held
 # fixed; only the directory DEPTH (and thus path length) varies, so peak memory
