@@ -1,0 +1,9 @@
+[submodule "spdlog"]
+	path = spdlog
+	url = git@github.com:gabime/spdlog.git
+[submodule "gtl"]
+	path = gtl
+	url = git@github.com:greg7mdp/gtl.git
+[submodule "CLI11"]
+	path = CLI11
+	url = git@github.com:CLIUtils/CLI11.git

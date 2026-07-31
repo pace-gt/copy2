@@ -1,0 +1,14 @@
+data/
+*.log
+*.db
+
+build/
+*/.cache/
+compile_commands.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
