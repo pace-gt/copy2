@@ -81,9 +81,14 @@ Emperically, `--file-copy-jobs=2048 --block-copy-jobs=256` works nicely. Additio
 * Use `--readback` to enable checksumming blocks.
 
 ## Installation
-The cmakelists for this project is in the utils directory, so
+Run
+```
+git submodule update --init
+```
+to install all submodule dependencies (if you didn't recursively clone the repo).
+
+The CmakeLists for this project is in the root directory, so
 ```bash
-cd utils
 mkdir build
 cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_INSTALL_PREFIX=<install-dir>
 make
