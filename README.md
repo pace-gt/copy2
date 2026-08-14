@@ -106,3 +106,10 @@ Generally, if migrating from a directory `src` to directory `dst`, the process w
 ```bash
 copy2 --allocator-mem-size=40GB --copy-buffer-size=30GB --max-block-size=8MB --crawlers=128 --finish-processors=128 --file-copy-jobs=2048 --block-copy-jobs=256 --sparse --readback --sync src dst
 ```
+
+## Contributors:
+Aiden Lambert (Developer)
+Deepa Phanish (Advisor)
+ 
+## Acknowledgement
+PACE, Georgia Institute of Technology
