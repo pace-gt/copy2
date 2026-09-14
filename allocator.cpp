@@ -146,6 +146,15 @@ AllocRef AllocatorAllocate(Allocator *alloc, size_t len) {
     assert(len);
     assert(alloc);
 
+#ifdef ALLOC_DEBUG
+    AllocDebug dbg = {
+        .canary = 0xDEADBEEF,
+        .magic = (uint32_t)rand(),
+        .size = len,
+    };
+    len += sizeof(AllocDebug);
+#endif
+
     void *allocation = NULL;
 
     if (alloc->nSubAllocators) {
@@ -160,15 +169,6 @@ AllocRef AllocatorAllocate(Allocator *alloc, size_t len) {
         allocation = buddy_calloc(suballoc, 1, len);
         alloc->subAllocatorLocks[allocNum].unlock();
     }
-
-#ifdef ALLOC_DEBUG
-    AllocDebug dbg = {
-        .canary = 0xDEADBEEF,
-        .magic = (uint32_t)rand(),
-        .size = len,
-    };
-    len += sizeof(AllocDebug);
-#endif
 
     if (!allocation) {
         alloc->lock.lock();
