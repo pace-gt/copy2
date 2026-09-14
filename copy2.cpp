@@ -324,7 +324,8 @@ inline void schedulerUpdateBlockCopyJob(CopyScheduler *sched,
 
             // O_DIRECT writes must be alignment-multiples. The trailing partial
             // block is the only unaligned case: round its length up to the
-            // alignment and zero the padding so we never write stale heap bytes.
+            // alignment and zero the padding so we never write stale heap
+            // bytes.
             size_t writeBytes = alignUp(blockJob->nbytes, DIRECT_IO_ALIGN);
             if (writeBytes > blockJob->nbytes) {
                 memset((char *)blockJob->data + blockJob->nbytes, 0,
@@ -1028,8 +1029,8 @@ int processDir(StringPartRef path, std::optional<dev_t> dev,
 
                     DirEntRef nodeRef =
                         AllocatorAllocate(globalAllocator, sizeof(DirEnt));
-                    DirEnt *node = (DirEnt *)allocDeref(globalAllocator, nodeRef,
-                                                        sizeof(DirEnt));
+                    DirEnt *node = (DirEnt *)allocDeref(
+                        globalAllocator, nodeRef, sizeof(DirEnt));
                     node->path = newPathRef;
                     node->isDir = true;
                     node->prev = toRemove;
@@ -1143,8 +1144,8 @@ void finishProcessorOne(SharedState *sharedState, FileCopyJob &fileJob) {
 
     if (fileJob.dstFd >= 0) {
         if (S_ISREG(fileJob.stx.stx_mode) &&
-            ftruncate_wrapper(sharedState, fileJob.dstFd, fileJob.stx.stx_size) <
-                0) {
+            ftruncate_wrapper(sharedState, fileJob.dstFd,
+                              fileJob.stx.stx_size) < 0) {
             spdlog::error("{} failed to truncate dst to final size {}: {}",
                           fileJob, (size_t)fileJob.stx.stx_size,
                           strerror(errno));
@@ -1236,6 +1237,11 @@ void finishProcessorOne(SharedState *sharedState, FileCopyJob &fileJob) {
              .tv_nsec = fileJob.stx.stx_mtime.tv_nsec},
         };
 
+        if (sharedState->opts.preserveAtime) {
+            times[0] = {.tv_sec = fileJob.stx.stx_atime.tv_sec,
+                        .tv_nsec = fileJob.stx.stx_atime.tv_nsec};
+        }
+
         if (!isNullRef(fileJob.partial) &&
             (spdlog::trace("{} finish queue linking "
                            "partial to remote {} -> {}",
@@ -1247,7 +1253,10 @@ void finishProcessorOne(SharedState *sharedState, FileCopyJob &fileJob) {
                           fileJob, partial, remote, strerror(errno));
             fileJobSuccess = false;
             partialDeleted = false;
-        } else if ((destStx.stx_mtime.tv_sec != fileJob.stx.stx_mtime.tv_sec) &&
+        } else if ((destStx.stx_mtime.tv_sec != fileJob.stx.stx_mtime.tv_sec ||
+                    (sharedState->opts.preserveAtime &&
+                     (destStx.stx_atime.tv_sec !=
+                      fileJob.stx.stx_atime.tv_sec))) &&
                    utimensat_wrapper(sharedState, dstFDGuard.fd(),
                                      dstRemoteName, times,
                                      AT_SYMLINK_NOFOLLOW) < 0) {
@@ -1486,6 +1495,8 @@ int main(int argc, char *argv[]) {
         ->required()
         ->check(CLI::ExistingDirectory);
     cli.add_flag("--sync", opts.sync, "delete extra files on the destination");
+    cli.add_flag("--preserve-atime", opts.preserveAtime,
+                 "preserve access time");
     cli.add_flag(
         "--sparse", opts.sparse,
         "don't write sparse blocks to destination to maintain sparseness");
@@ -1496,8 +1507,8 @@ int main(int argc, char *argv[]) {
     cli.add_option("--log-level", opts.logLevel,
                    "verbosity of the data-dir log file: "
                    "trace|debug|info|warn|error|critical|off")
-        ->check(CLI::IsMember({"trace", "debug", "info", "warn", "error",
-                               "critical", "off"}))
+        ->check(CLI::IsMember(
+            {"trace", "debug", "info", "warn", "error", "critical", "off"}))
         ->default_val("info");
     // cli.validate_positionals();
 
@@ -1510,8 +1521,9 @@ int main(int argc, char *argv[]) {
     // spdlog::cfg::load_env_levels();
 
     // File-log verbosity is configurable (default info). At the old hardcoded
-    // trace level this sink wrote ~11 lines per file copied and flushed on every
-    // message, which dominated write traffic (and CPU) for small-file trees.
+    // trace level this sink wrote ~11 lines per file copied and flushed on
+    // every message, which dominated write traffic (and CPU) for small-file
+    // trees.
     auto fileLevel = spdlog::level::from_str(opts.logLevel);
 
     double starttime = omp_get_wtime();
@@ -1651,8 +1663,6 @@ int main(int argc, char *argv[]) {
     dstRootFDRefGuard.deref()->path =
         STRING_PART_RC_INC(globalAllocator, rootRef);
     dstRootFDRefGuard.deref()->dst = false;
-
-    // spdlog::info("logger is {}", (void *)spdlog::default_logger_raw());
 
     int ret = 0;
 #pragma omp parallel sections

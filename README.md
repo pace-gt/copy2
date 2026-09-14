@@ -2,7 +2,7 @@
 Copies files from a source to a destination.
 
 ```
-copy2 [OPTIONS] src dest
+./copy2 [OPTIONS] src dest
 
 POSITIONALS:
   src TEXT:DIR REQUIRED       path to transfer files from 
@@ -34,8 +34,6 @@ OPTIONS:
                               maximum staging buffer size 
           --mem-per-thread UINT:SIZE [b, kb(=1024b), ...] [256KB]  
                               Memory per thread 
-          --readback BOOLEAN [0]  
-                              should we read transferred blocks back and run checksums? 
           --hlink-cache-members UINT [100000]  
                               number of hardlink entries to store in ram before writing to disk 
           --hlink-disk-size UINT:SIZE [b, kb(=1024b), ...] [1TB]  
@@ -43,8 +41,13 @@ OPTIONS:
           --max-FDs UINT [60000]  
                               maximum number of open file descriptors allowed 
           --sync              delete extra files on the destination 
+          --preserve-atime    preserve access time 
           --sparse            don't write sparse blocks to destination to maintain sparseness 
-          --extra-stats       enable the printing of internal statistics
+          --readback          should we read transferred blocks back and run checksums? 
+          --extra-stats       enable the printing of internal statistics 
+          --log-level TEXT:{trace,debug,info,warn,error,critical,off} [info]  
+                              verbosity of the data-dir log file: 
+                              trace|debug|info|warn|error|critical|off
 ```
 ### Memory
 One of the features of copy2 is its ability to finely tune how much memory the tool uses. All objects and buffers are allocated from a single arena whose size can be specified with `--allocator-mem-size` and/or `--allocator-disk-size` (which creates a memory mapped file). Additionally, thread-specific buffers are carved out of the allocator as well. The memory parameters thus must follow the following guidlines:
@@ -79,6 +82,7 @@ Emperically, `--file-copy-jobs=2048 --block-copy-jobs=256` works nicely. Additio
 * Use `--sparse` to disable the writing of blocks that are all zeros.
 * Use `--sync` to remove extra files on the destination (and thus make the source and destination identical)
 * Use `--readback` to enable checksumming blocks.
+* Use `--preserve-atime` to preserve access time on the destination
 
 ## Installation
 Run

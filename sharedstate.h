@@ -23,6 +23,8 @@ struct Opts {
     size_t hlinkDiskSize;
     size_t maxFDs;
 
+    bool preserveAtime;
+
     bool readback;
     bool sparse;
     bool sync;
