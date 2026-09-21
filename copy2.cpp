@@ -594,6 +594,8 @@ int recursiveRemoveNonDir(int dstfd, StringPartRef path,
         spdlog::error("recursiveRemoveNonDir failed to remove file {}: {}",
                       remote, strerror(errno));
         return -1;
+    } else {
+        sharedState->filesRemoved++;
     }
 
     return 0;
@@ -613,6 +615,7 @@ int recursiveRemove(int dstfd, StringPartRef path, SharedState *sharedState,
         (const char *)allocDeref(globalAllocator, remoteBuf, remoteBufSize);
 
     if (depth == 0 && unlinkat_wrapper(sharedState, dstfd, remote, 0) == 0) {
+        sharedState->filesRemoved++;
         return 0;
     } else if (depth == 0 && errno == ENOENT) {
         return 0;
@@ -694,6 +697,8 @@ int recursiveRemove(int dstfd, StringPartRef path, SharedState *sharedState,
     if (unlinkat_wrapper(sharedState, dstfd, remote, AT_REMOVEDIR) < 0) {
         spdlog::error("recursiveRemove failed to remove directory {}: {}",
                       remote, strerror(errno));
+    } else {
+        sharedState->filesRemoved++;
     }
 
     return 0;
@@ -1337,9 +1342,11 @@ void incrementalLogger(SharedState *sharedState) {
         double delta = now - lastPrint;
         if (delta > 3.0 || done) {
             spdlog::info(
-                "transferred {}/{} files, {}({})/{}({}) (read {}/s, "
+                "transferred {}/{} files, removed {} files, {}({})/{}({}) "
+                "(read {}/s, "
                 "write {}/s)",
                 sharedState->nFinished.load(), sharedState->filesSeen.load(),
+                sharedState->filesRemoved.load(),
                 bytesize::bytesize{sharedState->totalBytesTransferred.load()},
                 bytesize::bytesize{
                     sharedState->totalBytesActuallyTransferred.load()},

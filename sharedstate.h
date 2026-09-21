@@ -47,6 +47,7 @@ struct SharedState {
 
     std::atomic_size_t nFinished;
     std::atomic_size_t filesSeen;
+    std::atomic_size_t filesRemoved;
     std::atomic_size_t totalBytesTransferred; // actually transferred + existing
     std::atomic_size_t totalBytesActuallyTransferred;
     std::atomic_size_t totalBytesSeenAndWillTransfer;
